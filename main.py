@@ -1,9 +1,9 @@
 """
-⚡ ULTRA VIP V4 — Full Fixed Edition
+⚡ ULTRA VIP V4 — Full Fixed (Match Bot Connection)
 35 AI Cores · Live Accuracy · Confidence Gating · Kelly Sizing · Stop-Loss · Cooldown
 Web UI · LC79 Manual Code · Auto Bet · Background Data Collector
 """
-import os, hashlib, base64, json, logging, threading, time, random, math
+import os, hashlib, base64, json, logging, threading, time, random, math, queue, sys
 import requests
 import socketio as sio_client
 from flask import Flask, request, jsonify, Response
@@ -32,6 +32,45 @@ webio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_tim
 DATA_COLLECTOR_USER = os.environ.get('COLLECTOR_USER', 'acc_clone_soi_cau')
 DATA_COLLECTOR_PASS = os.environ.get('COLLECTOR_PASS', 'matkhau123')
 ENABLE_BG_COLLECTOR = os.environ.get('ENABLE_BG_COLLECTOR', '0') == '1'
+
+# ============================================================
+# EMIT QUEUE — DECOUPLE webio FROM GAME WS THREAD
+# ============================================================
+_EMIT_QUEUE = queue.Queue(maxsize=5000)
+_EMIT_THREAD_STARTED = False
+
+def _emit_worker():
+    """Thread riêng xử lý webio.emit — KHÔNG chạy trên game WS thread."""
+    while True:
+        try:
+            item = _EMIT_QUEUE.get(timeout=1)
+            if item is None:
+                continue
+            event, data, uid = item
+            try:
+                webio.emit(event, data, room=uid)
+            except Exception as e:
+                logger.debug(f"emit {event} fail: {e}")
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logger.debug(f"emit_worker: {e}")
+
+def _start_emit_worker():
+    global _EMIT_THREAD_STARTED
+    if _EMIT_THREAD_STARTED:
+        return
+    _EMIT_THREAD_STARTED = True
+    t = threading.Thread(target=_emit_worker, daemon=True, name='emit-worker')
+    t.start()
+    logger.info("✅ Emit worker thread đã khởi động")
+
+def safe_emit(event, data, uid):
+    """Thread-safe emit — đẩy vào queue, KHÔNG gọi webio trực tiếp."""
+    try:
+        _EMIT_QUEUE.put_nowait((event, data, uid))
+    except queue.Full:
+        logger.debug(f"emit queue full, drop {event}")
 
 # ============================================================
 # GLOBAL STATE
@@ -93,25 +132,16 @@ def get_user():
     return USERS[uid], uid
 
 def add_log(uid, message, level='info'):
-    """Thread-safe log — không bao giờ raise."""
+    """Thread-safe log — push vào queue."""
     try:
         if uid not in USERS: return
         ts = datetime.now().strftime('%H:%M:%S')
         entry = {'ts': ts, 'msg': message, 'level': level}
         USERS[uid]['logs'].append(entry)
-        try:
-            webio.emit('log', entry, room=uid)
-        except Exception as e:
-            logger.debug(f"webio.emit log skipped: {e}")
+        safe_emit('log', entry, uid)
     except Exception as e:
         logger.debug(f"add_log skipped: {e}")
 
-def safe_emit(event, data, uid):
-    """Thread-safe emit — không bao giờ raise."""
-    try:
-        webio.emit(event, data, room=uid)
-    except Exception as e:
-        logger.debug(f"safe_emit {event} skipped: {e}")
 
 # ============================================================
 # 35 AI CORES
@@ -355,9 +385,14 @@ def login_tele68(username, password):
 
 
 # ============================================================
-# GAME WEBSOCKET — FULL FIX với retry + diagnostics
+# GAME WEBSOCKET — MATCH BOT EXACTLY
 # ============================================================
 def start_game_ws(uid, attempt=1, max_attempts=3):
+    """
+    Connect tới game WS — Y HỆT cách bot hoạt động.
+    QUAN TRỌNG: KHÔNG gọi webio.emit() trực tiếp trong handler.
+    Mọi emit đều đi qua safe_emit() → queue → emit_worker thread.
+    """
     state = USERS.get(uid)
     if not state:
         logger.warning(f"start_game_ws: uid {uid} không tồn tại")
@@ -368,94 +403,98 @@ def start_game_ws(uid, attempt=1, max_attempts=3):
 
     tok = state['token']
     is_bg = state.get('_is_bg', False)
-    add_log(uid, f"🔑 Token len={len(tok)} · {tok[:24]}... · attempt {attempt}/{max_attempts}", 'info')
+    add_log(uid, f"🔑 Token len={len(tok)} · attempt {attempt}/{max_attempts}", 'info')
 
     # Dọn kết nối cũ
     if uid in GAME_CLIENTS:
         try: GAME_CLIENTS[uid].disconnect()
         except: pass
         GAME_CLIENTS.pop(uid, None)
+        time.sleep(0.5)
 
-    client = sio_client.Client(
+    # Tạo client Y HỆT bot
+    sio = sio_client.Client(
         reconnection=True,
         reconnection_attempts=3,
         logger=False,
         engineio_logger=False,
     )
-    GAME_CLIENTS[uid] = client
+    GAME_CLIENTS[uid] = sio
 
-    # ---------- CONNECT HANDLERS ----------
-    @client.event(namespace='/txmd5')
+    # ---------- HANDLERS ----------
+    @sio.event(namespace='/txmd5')
     def connect():
         add_log(uid, "✅ WS /txmd5 đã kết nối!", 'success')
         safe_emit('status', {'connected': True}, uid)
 
-    @client.event(namespace='/txmd5')
+    @sio.event(namespace='/txmd5')
     def connect_error(data):
         add_log(uid, f"❌ WS connect_error: {data}", 'error')
         safe_emit('status', {'connected': False, 'error': str(data)}, uid)
 
-    @client.event(namespace='/txmd5')
+    @sio.event(namespace='/txmd5')
     def disconnect():
         add_log(uid, "⚠️ WS đã ngắt kết nối", 'warn')
         safe_emit('status', {'connected': False}, uid)
 
-    # ---------- GAME EVENTS ----------
-    @client.on('new-session', namespace='/txmd5')
+    @sio.on('new-session', namespace='/txmd5')
     def on_new_session(data):
-        state['session_id'] = data.get('id', '?')
-        state['has_bet_this_session'] = False
-        state['waiting_for_result'] = False
+        try:
+            state['session_id'] = data.get('id', '?')
+            state['has_bet_this_session'] = False
+            state['waiting_for_result'] = False
 
-        pred, conf, details = make_prediction(uid)
-        state['current_prediction'] = pred
-        state['current_confidence'] = conf
-        state['confidence_details'] = details
+            pred, conf, details = make_prediction(uid)
+            state['current_prediction'] = pred
+            state['current_confidence'] = conf
+            state['confidence_details'] = details
 
-        allowed, reason = check_risk_limits(uid)
-        if pred is None:
-            state['skip_reason'] = details.get('reason', 'Không có dự đoán')
-            state['current_prediction'] = None
-        elif not allowed:
-            state['current_prediction'] = None
-            state['skip_reason'] = reason
-            add_log(uid, f"🛑 SKIP phiên: {reason}", 'warn')
-        elif conf < state['confidence_threshold']:
-            state['current_prediction'] = None
-            state['skip_reason'] = f"Confidence {conf:.0%} < {state['confidence_threshold']:.0%}"
-            add_log(uid, f"🛑 SKIP phiên: conf {conf:.0%} thấp", 'warn')
-        else:
-            state['skip_reason'] = None
-            add_log(
-                uid,
-                f"🎯 AI chốt {pred} (conf {conf:.0%} · margin {details.get('margin',0):.0%} · "
-                f"top {details.get('top_consensus',0):.0%})",
-                'info'
-            )
+            allowed, reason = check_risk_limits(uid)
+            if pred is None:
+                state['skip_reason'] = details.get('reason', 'Không có dự đoán')
+                state['current_prediction'] = None
+            elif not allowed:
+                state['current_prediction'] = None
+                state['skip_reason'] = reason
+                add_log(uid, f"🛑 SKIP phiên: {reason}", 'warn')
+            elif conf < state['confidence_threshold']:
+                state['current_prediction'] = None
+                state['skip_reason'] = f"Confidence {conf:.0%} < {state['confidence_threshold']:.0%}"
+                add_log(uid, f"🛑 SKIP phiên: conf {conf:.0%} thấp", 'warn')
+            else:
+                state['skip_reason'] = None
+                add_log(
+                    uid,
+                    f"🎯 AI chốt {pred} (conf {conf:.0%} · margin {details.get('margin',0):.0%} · "
+                    f"top {details.get('top_consensus',0):.0%})",
+                    'info'
+                )
 
-        if state['x2_mode'] and state['win_streak'] >= 1:
-            kelly = calculate_bet_size(uid)
-            state['current_bet'] = max(kelly, state['base_bet'] * 2)
-        else:
-            state['current_bet'] = calculate_bet_size(uid) or state['base_bet']
-        state['kelly_size'] = state['current_bet']
+            if state['x2_mode'] and state['win_streak'] >= 1:
+                kelly = calculate_bet_size(uid)
+                state['current_bet'] = max(kelly, state['base_bet'] * 2)
+            else:
+                state['current_bet'] = calculate_bet_size(uid) or state['base_bet']
+            state['kelly_size'] = state['current_bet']
 
-        safe_emit('new_session', {
-            'session_id': state['session_id'],
-            'prediction': state['current_prediction'],
-            'confidence': round(state['current_confidence'], 3),
-            'confidence_details': details,
-            'current_bet': state['current_bet'],
-            'skip_reason': state['skip_reason'],
-            'history_len': len(GLOBAL_HISTORY),
-        }, uid)
+            safe_emit('new_session', {
+                'session_id': state['session_id'],
+                'prediction': state['current_prediction'],
+                'confidence': round(state['current_confidence'], 3),
+                'confidence_details': details,
+                'current_bet': state['current_bet'],
+                'skip_reason': state['skip_reason'],
+                'history_len': len(GLOBAL_HISTORY),
+            }, uid)
+        except Exception as e:
+            add_log(uid, f"❌ new_session handler: {e}", 'error')
 
-    @client.on('tick-update', namespace='/txmd5')
+    @sio.on('tick-update', namespace='/txmd5')
     def on_tick(data):
-        if data.get('state') == 'BETTING' and state['auto_bet_enabled'] and state['current_prediction']:
-            if not state['has_bet_this_session']:
-                try:
-                    client.emit('bet', {
+        try:
+            if data.get('state') == 'BETTING' and state['auto_bet_enabled'] and state['current_prediction']:
+                if not state['has_bet_this_session']:
+                    sio.emit('bet', {
                         "type": state['current_prediction'],
                         "amount": state['current_bet']
                     }, namespace='/txmd5')
@@ -466,113 +505,102 @@ def start_game_ws(uid, attempt=1, max_attempts=3):
                         'amount': state['current_bet'],
                         'type': state['current_prediction'],
                     }, uid)
-                except Exception as e:
-                    add_log(uid, f"❌ Lỗi đặt cược: {e}", 'error')
+        except Exception as e:
+            add_log(uid, f"❌ tick handler: {e}", 'error')
 
-    @client.on('bet-result', namespace='/txmd5')
+    @sio.on('bet-result', namespace='/txmd5')
     def on_bet_result(data):
-        if "postBalance" in data:
-            state['balance'] = data["postBalance"]
-            safe_emit('balance', {'balance': state['balance']}, uid)
-        client.emit('get-current-my-info', None, namespace='/txmd5')
+        try:
+            if "postBalance" in data:
+                state['balance'] = data["postBalance"]
+                safe_emit('balance', {'balance': state['balance']}, uid)
+            sio.emit('get-current-my-info', None, namespace='/txmd5')
+        except Exception as e:
+            logger.debug(f"bet-result: {e}")
 
-    @client.on('session-result', namespace='/txmd5')
+    @sio.on('session-result', namespace='/txmd5')
     def on_result(data):
-        result = data.get('resultTruyenThong', 'N/A')
-        dices = data.get('dices', [0, 0, 0])
-        state['last_dices'] = dices
-        state['last_result'] = result
+        try:
+            result = data.get('resultTruyenThong', 'N/A')
+            dices = data.get('dices', [0, 0, 0])
+            state['last_dices'] = dices
+            state['last_result'] = result
 
-        if result in ("TAI", "XIU"):
-            GLOBAL_HISTORY.append(result)
-            update_ai_weights(result, uid)
+            if result in ("TAI", "XIU"):
+                GLOBAL_HISTORY.append(result)
+                update_ai_weights(result, uid)
 
-        prediction = state['current_prediction']
-        won = (prediction == result) if prediction else None
+            prediction = state['current_prediction']
+            won = (prediction == result) if prediction else None
 
-        if state['waiting_for_result'] and prediction:
-            if won:
-                win_amt = int(state['current_bet'] * 0.98)
-                state['profit_loss'] += win_amt
-                state['win_streak'] += 1
-                state['consecutive_losses'] = 0
-                add_log(uid, f"✅ THẮNG {result} — +{win_amt:,} Win (streak {state['win_streak']})", 'win')
-                if state['notify_win']:
-                    safe_emit('notify', {
-                        'type': 'win', 'amount': win_amt, 'result': result,
-                        'dices': dices, 'streak': state['win_streak'],
-                    }, uid)
-            else:
-                state['profit_loss'] -= state['current_bet']
-                state['win_streak'] = 0
-                state['consecutive_losses'] += 1
-                if state['consecutive_losses'] >= 3:
-                    state['cooldown_remaining'] = 5
+            if state['waiting_for_result'] and prediction:
+                if won:
+                    win_amt = int(state['current_bet'] * 0.98)
+                    state['profit_loss'] += win_amt
+                    state['win_streak'] += 1
                     state['consecutive_losses'] = 0
-                    add_log(uid, "🛑 THUA 3 liên tiếp → nghỉ 5 phiên", 'warn')
-                add_log(uid, f"❌ THUA {result} — -{state['current_bet']:,} Win", 'lose')
-                if state['notify_lose']:
-                    safe_emit('notify', {
-                        'type': 'lose', 'amount': -state['current_bet'],
-                        'result': result, 'dices': dices,
-                    }, uid)
-            state['waiting_for_result'] = False
+                    add_log(uid, f"✅ THẮNG {result} — +{win_amt:,} Win (streak {state['win_streak']})", 'win')
+                    if state['notify_win']:
+                        safe_emit('notify', {
+                            'type': 'win', 'amount': win_amt, 'result': result,
+                            'dices': dices, 'streak': state['win_streak'],
+                        }, uid)
+                else:
+                    state['profit_loss'] -= state['current_bet']
+                    state['win_streak'] = 0
+                    state['consecutive_losses'] += 1
+                    if state['consecutive_losses'] >= 3:
+                        state['cooldown_remaining'] = 5
+                        state['consecutive_losses'] = 0
+                        add_log(uid, "🛑 THUA 3 liên tiếp → nghỉ 5 phiên", 'warn')
+                    add_log(uid, f"❌ THUA {result} — -{state['current_bet']:,} Win", 'lose')
+                    if state['notify_lose']:
+                        safe_emit('notify', {
+                            'type': 'lose', 'amount': -state['current_bet'],
+                            'result': result, 'dices': dices,
+                        }, uid)
+                state['waiting_for_result'] = False
 
-        safe_emit('result', {
-            'result': result, 'dices': dices,
-            'prediction': prediction, 'won': won,
-            'profit_loss': state['profit_loss'],
-            'win_streak': state['win_streak'],
-            'balance': state['balance'],
-            'consecutive_losses': state['consecutive_losses'],
-            'cooldown_remaining': state['cooldown_remaining'],
-            'history': list(GLOBAL_HISTORY)[-40:],
-        }, uid)
-
-    # ---------- CONNECT với fallback transports ----------
-    transports_list = [['websocket']]
-    if attempt >= 2:
-        transports_list = [['polling', 'websocket'], ['websocket']]
-        add_log(uid, "🔄 Thử fallback transports polling+websocket", 'warn')
-
-    ok = False
-    for transports in transports_list:
-        try:
-            add_log(uid, f"🔌 Connecting transports={transports}...", 'info')
-            client.connect(
-                'https://wtxmd52.tele68.com',
-                socketio_path='txmd5/',
-                namespaces=['/txmd5'],
-                transports=transports,
-                auth={"token": tok},
-                headers={"User-Agent": "Mozilla/5.0"},
-                wait_timeout=15,
-            )
-            ok = True
-            add_log(uid, "✅ Namespace /txmd5 OK", 'success')
-            break
+            safe_emit('result', {
+                'result': result, 'dices': dices,
+                'prediction': prediction, 'won': won,
+                'profit_loss': state['profit_loss'],
+                'win_streak': state['win_streak'],
+                'balance': state['balance'],
+                'consecutive_losses': state['consecutive_losses'],
+                'cooldown_remaining': state['cooldown_remaining'],
+                'history': list(GLOBAL_HISTORY)[-40:],
+            }, uid)
         except Exception as e:
-            add_log(uid, f"❌ Fail ({transports}): {e}", 'error')
-            try: client.disconnect()
-            except: pass
-            time.sleep(1.5)
+            add_log(uid, f"❌ session-result handler: {e}", 'error')
 
-    if ok:
-        try:
-            client.wait()
-        except Exception as e:
-            add_log(uid, f"⚠️ wait error: {e}", 'warn')
-
-    # ---------- Retry nếu fail ----------
-    if not ok:
+    # ---------- CONNECT — Y HỆT BOT ----------
+    try:
+        add_log(uid, "🔌 Connecting...", 'info')
+        sio.connect(
+            'https://wtxmd52.tele68.com',
+            socketio_path='txmd5/',
+            namespaces=['/txmd5'],
+            transports=['websocket'],
+            auth={"token": tok},
+            headers={"User-Agent": "Mozilla/5.0"},
+            wait_timeout=30,
+        )
+        add_log(uid, "✅ Namespace /txmd5 OK — đang chờ event...", 'success')
+        sio.wait()
+    except Exception as e:
+        add_log(uid, f"❌ Connect fail: {e}", 'error')
+        try: sio.disconnect()
+        except: pass
         GAME_CLIENTS.pop(uid, None)
+
         if attempt < max_attempts and not is_bg:
             delay = 3 * attempt
             add_log(uid, f"🔄 Retry {attempt+1}/{max_attempts} sau {delay}s...", 'warn')
             time.sleep(delay)
             start_game_ws(uid, attempt + 1, max_attempts)
         elif not is_bg:
-            add_log(uid, "❌ WS thất bại sau nhiều lần — hãy logout → login lại", 'error')
+            add_log(uid, "❌ WS thất bại — kiểm tra: (1) bot cũ có đang chạy cùng account không? (2) token còn hạn? (3) mạng chặn WS?", 'error')
             safe_emit('status', {'connected': False, 'error': 'WS failed after retries'}, uid)
 
 
@@ -580,7 +608,6 @@ def start_game_ws(uid, attempt=1, max_attempts=3):
 # BACKGROUND DATA COLLECTOR
 # ============================================================
 def background_data_collector():
-    """Login acc riêng, giữ WS sống để tích lũy GLOBAL_HISTORY 24/7."""
     global _BG_THREAD_STARTED
     if _BG_THREAD_STARTED:
         return
@@ -677,6 +704,7 @@ def api_state():
         'cooldown_remaining': u.get('cooldown_remaining', 0),
         'stop_loss': u.get('stop_loss', 500000),
         'confidence_details': u.get('confidence_details', {}),
+        'history_len': len(GLOBAL_HISTORY),
     })
 
 
@@ -689,7 +717,6 @@ def api_login():
     if not username or not password:
         return jsonify({'ok': False, 'error': 'Thiếu tài khoản hoặc mật khẩu'}), 400
 
-    # Ngắt WS cũ nếu có
     if uid in GAME_CLIENTS:
         try: GAME_CLIENTS[uid].disconnect()
         except: pass
@@ -701,7 +728,6 @@ def api_login():
         add_log(uid, f"❌ Login fail: {result['_error']}", 'error')
         return jsonify({'ok': False, 'error': result['_error']}), 400
 
-    # Set toàn bộ state TRƯỚC khi start thread
     u['token'] = result['token']
     u['nickname'] = result['nickname']
     u['balance'] = result['money']
@@ -730,6 +756,20 @@ def api_logout():
     u['auto_bet_enabled'] = False
     u['token'] = None
     add_log(uid, "🔌 Đã đăng xuất", 'warn')
+    return jsonify({'ok': True})
+
+
+@app.route('/api/reconnect', methods=['POST'])
+def api_reconnect():
+    u, uid = get_user()
+    if not u['token']:
+        return jsonify({'ok': False, 'error': 'Chưa login'}), 400
+    if uid in GAME_CLIENTS:
+        try: GAME_CLIENTS[uid].disconnect()
+        except: pass
+        GAME_CLIENTS.pop(uid, None)
+    add_log(uid, "🔄 Manual reconnect...", 'info')
+    threading.Thread(target=start_game_ws, args=(uid,), daemon=True).start()
     return jsonify({'ok': True})
 
 
@@ -766,9 +806,7 @@ def api_config():
     if 'stop_loss' in d:
         try: u['stop_loss'] = int(d['stop_loss'])
         except: u['stop_loss'] = 0
-    return jsonify({'ok': True, 'state': {
-        'base_bet': u['base_bet'], 'auto_bet_enabled': u['auto_bet_enabled'], 'x2_mode': u['x2_mode'],
-    }})
+    return jsonify({'ok': True})
 
 
 @app.route('/api/code', methods=['POST'])
@@ -789,17 +827,6 @@ def api_code():
 def api_ai():
     top = sorted(GLOBAL_AI_WEIGHTS.items(), key=lambda x: x[1], reverse=True)[:20]
     return jsonify({'top': top, 'history_len': len(GLOBAL_HISTORY)})
-
-
-@app.route('/api/reconnect', methods=['POST'])
-def api_reconnect():
-    """Manual reconnect WS."""
-    u, uid = get_user()
-    if not u['token']:
-        return jsonify({'ok': False, 'error': 'Chưa login'}), 400
-    add_log(uid, "🔄 Manual reconnect...", 'info')
-    threading.Thread(target=start_game_ws, args=(uid,), daemon=True).start()
-    return jsonify({'ok': True})
 
 
 # ============================================================
@@ -837,153 +864,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   * { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
   .mono { font-family: 'JetBrains Mono', monospace; }
-  body {
-    background: #0b0b12;
-    color: #e5e7eb;
-    min-height: 100vh;
-    margin: 0;
-    overflow-x: hidden;
-    -webkit-tap-highlight-color: transparent;
-  }
-  .card {
-    background: #13131d;
-    border: 1px solid #232330;
-    border-radius: 12px;
-    padding: 20px;
-  }
-  .card-tight { padding: 14px 18px; }
-  .label-xs {
-    font-size: 10px;
-    font-weight: 700;
-    color: #71717a;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-  }
-  .btn {
-    background: #6366f1;
-    color: #fff;
-    border: none;
-    border-radius: 8px;
-    padding: 11px 18px;
-    font-weight: 600;
-    font-size: 14px;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
+  body { background: #0b0b12; color: #e5e7eb; min-height: 100vh; margin: 0; overflow-x: hidden; -webkit-tap-highlight-color: transparent; }
+  .card { background: #13131d; border: 1px solid #232330; border-radius: 12px; padding: 20px; }
+  .label-xs { font-size: 10px; font-weight: 700; color: #71717a; text-transform: uppercase; letter-spacing: 0.06em; }
+  .btn { background: #6366f1; color: #fff; border: none; border-radius: 8px; padding: 11px 18px; font-weight: 600; font-size: 14px; cursor: pointer; transition: background 0.15s; }
   .btn:hover:not(:disabled) { background: #4f46e5; }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn-ghost {
-    background: #1a1a26;
-    border: 1px solid #2a2a3a;
-    color: #d4d4d8;
-  }
+  .btn-ghost { background: #1a1a26; border: 1px solid #2a2a3a; color: #d4d4d8; }
   .btn-ghost:hover:not(:disabled) { background: #232330; }
-  .input {
-    background: #0a0a12;
-    border: 1px solid #2a2a3a;
-    border-radius: 8px;
-    padding: 10px 12px;
-    color: #f3f4f6;
-    width: 100%;
-    font-size: 14px;
-    outline: none;
-    transition: border-color 0.15s;
-  }
+  .input { background: #0a0a12; border: 1px solid #2a2a3a; border-radius: 8px; padding: 10px 12px; color: #f3f4f6; width: 100%; font-size: 14px; outline: none; transition: border-color 0.15s; }
   .input:focus { border-color: #6366f1; }
-  .toggle {
-    position: relative;
-    width: 44px;
-    height: 24px;
-    background: #2a2a3a;
-    border-radius: 999px;
-    cursor: pointer;
-    transition: background 0.2s;
-    flex-shrink: 0;
-    border: none;
-    padding: 0;
-  }
-  .toggle::after {
-    content: '';
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 20px;
-    height: 20px;
-    background: #fff;
-    border-radius: 50%;
-    transition: transform 0.2s;
-  }
+  .toggle { position: relative; width: 44px; height: 24px; background: #2a2a3a; border-radius: 999px; cursor: pointer; transition: background 0.2s; flex-shrink: 0; border: none; padding: 0; }
+  .toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; background: #fff; border-radius: 50%; transition: transform 0.2s; }
   .toggle.on { background: #6366f1; }
   .toggle.on::after { transform: translateX(20px); }
-  .history-bar {
-    height: 30px;
-    border-radius: 4px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 10px;
-    font-weight: 800;
-    color: #fff;
-  }
+  .history-bar { height: 30px; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 800; color: #fff; }
   .bar-tai { background: #3b82f6; }
   .bar-xiu { background: #ef4444; }
-  .dice {
-    width: 54px;
-    height: 54px;
-    background: #e5e7eb;
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 26px;
-    font-weight: 800;
-    color: #111827;
-  }
-  .log-line {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 11px;
-    padding: 5px 9px;
-    border-radius: 4px;
-    margin-bottom: 3px;
-    background: #0a0a12;
-    border-left: 2px solid #6366f1;
-    line-height: 1.45;
-    word-break: break-word;
-  }
+  .dice { width: 54px; height: 54px; background: #e5e7eb; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 26px; font-weight: 800; color: #111827; }
+  .log-line { font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 5px 9px; border-radius: 4px; margin-bottom: 3px; background: #0a0a12; border-left: 2px solid #6366f1; line-height: 1.45; word-break: break-word; }
   .log-info { border-color: #6366f1; color: #c7d2fe; }
   .log-success, .log-win { border-color: #10b981; color: #86efac; }
   .log-error, .log-lose { border-color: #ef4444; color: #fca5a5; }
   .log-warn { border-color: #f59e0b; color: #fde68a; }
   .log-bet { border-color: #8b5cf6; color: #ddd6fe; }
-  .toast {
-    position: fixed;
-    top: 16px;
-    right: 16px;
-    padding: 12px 18px;
-    border-radius: 8px;
-    font-weight: 600;
-    font-size: 13px;
-    z-index: 9999;
-    border: 1px solid;
-    background: #13131d;
-    min-width: 240px;
-    animation: fadeIn 0.2s ease-out;
-  }
+  .toast { position: fixed; top: 16px; right: 16px; padding: 12px 18px; border-radius: 8px; font-weight: 600; font-size: 13px; z-index: 9999; border: 1px solid; background: #13131d; min-width: 240px; animation: fadeIn 0.2s ease-out; }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
   .toast-win { border-color: #10b981; color: #86efac; }
   .toast-lose { border-color: #ef4444; color: #fca5a5; }
   .scroll::-webkit-scrollbar { width: 5px; }
   .scroll::-webkit-scrollbar-track { background: transparent; }
   .scroll::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 3px; }
-  .badge {
-    display: inline-flex;
-    align-items: center;
-    padding: 3px 8px;
-    border-radius: 4px;
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.03em;
-  }
+  .badge { display: inline-flex; align-items: center; padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; letter-spacing: 0.03em; }
   .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #71717a; }
   .status-dot.online { background: #10b981; }
   .progress { height: 6px; background: #1a1a26; border-radius: 999px; overflow: hidden; }
@@ -1018,7 +930,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <main style="max-width: 1200px; margin: 0 auto; padding: 20px;">
 
-<!-- LOGIN SCREEN -->
 <section id="loginScreen">
   <div style="max-width: 420px; margin: 40px auto 0;">
     <div class="card">
@@ -1043,9 +954,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </section>
 
-<!-- DASHBOARD -->
 <section id="dashboard" style="display: none;">
-  <div style="display: grid; grid-template-columns: 1fr; gap: 16px;" id="dashGrid">
+  <div style="display: grid; grid-template-columns: 1fr; gap: 16px;">
 
     <div style="display: flex; flex-direction: column; gap: 16px;">
       <div class="card">
@@ -1236,7 +1146,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </footer>
 
 <script>
-// ===== DISABLE PINCH-ZOOM & DOUBLE-TAP ZOOM =====
 document.addEventListener('gesturestart', e => e.preventDefault(), { passive: false });
 document.addEventListener('gesturechange', e => e.preventDefault(), { passive: false });
 document.addEventListener('gestureend', e => e.preventDefault(), { passive: false });
@@ -1540,15 +1449,24 @@ document.addEventListener('DOMContentLoaded', () => {
 # RUN
 # ============================================================
 if __name__ == '__main__':
+    _start_emit_worker()
+
     port = int(os.environ.get('PORT', 5000))
     print("=" * 60)
-    print("⚡ ULTRA VIP V4 — FULL FIXED EDITION")
+    print("⚡ ULTRA VIP V4 — FULL FIX (Match Bot Connection)")
     print(f"   http://0.0.0.0:{port}")
     print(f"   Background Collector: {'BẬT' if ENABLE_BG_COLLECTOR else 'TẮT'}")
-    print("   Clean UI · No Zoom · Top-K Consensus · Confidence Gating")
+    print(f"   Python: {sys.version.split()[0]}")
+    try:
+        import socketio as _s
+        print(f"   python-socketio: {_s.__version__}")
+    except: pass
+    try:
+        import engineio as _e
+        print(f"   python-engineio: {_e.__version__}")
+    except: pass
     print("=" * 60)
 
-    # Khởi động background collector (nếu bật)
     threading.Thread(target=background_data_collector, daemon=True).start()
 
     webio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
