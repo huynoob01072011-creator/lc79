@@ -1,10 +1,9 @@
 # ============================================================================
-#  LC79 AUTO REDEEM - WEB EDITION (single file)
-#  Deploy Render: gunicorn --workers=1 --threads=8 --timeout=0 --bind=0.0.0.0:$PORT main:app
+#  LC79 AUTO REDEEM - WEB EDITION
+#  Deploy: gunicorn --workers=1 --threads=8 --timeout=0 --bind=0.0.0.0:$PORT main:app
 # ============================================================================
 import os
 import re
-import sys
 import time
 import json
 import base64
@@ -25,19 +24,14 @@ from telethon.errors import (
     FloodWaitError,
 )
 
-# ============================================================================
-# GLOBAL STATE
-# ============================================================================
 app = Flask(__name__)
 
+# ----------------------------------------------------------------------------
+# Global state
+# ----------------------------------------------------------------------------
 STATE = {
-    "config": {
-        "api_id": None,
-        "api_hash": None,
-        "phone": None,
-        "group_link": None,
-        "accounts": [],
-    },
+    "config": {"api_id": None, "api_hash": None, "phone": None,
+               "group_link": None, "accounts": []},
     "session_string": None,
     "target_chat_id": None,
     "bot_running": False,
@@ -46,27 +40,28 @@ STATE = {
 }
 
 LOGS = deque(maxlen=500)
+LOGS_VERSION = 0
 LOG_LOCK = threading.Lock()
 
 
 def log(msg, level="info"):
+    global LOGS_VERSION
     ts = datetime.now().strftime("%H:%M:%S")
     with LOG_LOCK:
         LOGS.append({"ts": ts, "msg": msg, "level": level})
+        LOGS_VERSION += 1
     try:
         print(f"[{ts}] {msg}", flush=True)
     except Exception:
         pass
 
 
-# ============================================================================
-# GAME ACCOUNT
-# ============================================================================
+# ----------------------------------------------------------------------------
+# Game account
+# ----------------------------------------------------------------------------
 class Account:
     def __init__(self, un, pw, nick):
-        self.un = un
-        self.pw = pw
-        self.nick = nick
+        self.un, self.pw, self.nick = un, pw, nick
         self.used_codes = set()
         self.lock = threading.Lock()
         self.jwt = None
@@ -90,8 +85,7 @@ class Account:
         try:
             payload = token.split(".")[1]
             payload += "=" * (-len(payload) % 4)
-            data = json.loads(base64.urlsafe_b64decode(payload))
-            return data.get("exp", 0)
+            return json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0)
         except Exception:
             return 0
 
@@ -157,13 +151,12 @@ class Account:
         if not self.is_token_valid():
             log(f"[{self.nick}] 🔄 Token hết hạn → login lại")
             if not self.refresh_token():
-                log(f"[{self.nick}] ❌ Không login được → bỏ qua {code}", "error")
+                log(f"[{self.nick}] ❌ Không login được → bỏ {code}", "error")
                 with self.lock:
                     self.used_codes.discard(code)
                 return
 
         log(f"[{self.nick}] 🚀 Redeem: {code}")
-
         try:
             with requests.Session() as s:
                 res = s.post(
@@ -190,10 +183,8 @@ class Account:
             if res.status_code in (200, 201):
                 amt = (data.get("money") or data.get("amount") or data.get("reward")
                        or (data.get("data") or {}).get("money"))
-                if amt:
-                    log(f"[{self.nick}] 💰 SUCCESS: +{int(amt):,}", "success")
-                else:
-                    log(f"[{self.nick}] ✅ SUCCESS", "success")
+                log(f"[{self.nick}] 💰 SUCCESS: +{int(amt):,}" if amt
+                    else f"[{self.nick}] ✅ SUCCESS", "success")
             elif res.status_code == 400:
                 msg = data.get("message") if isinstance(data, dict) else res.text
                 log(f"[{self.nick}] ❌ FAIL (400): {msg}", "error")
@@ -240,9 +231,9 @@ def redeem_all_sync(code):
         t.join()
 
 
-# ============================================================================
-# TELEGRAM ASYNC LOOP
-# ============================================================================
+# ----------------------------------------------------------------------------
+# Telegram async loop
+# ----------------------------------------------------------------------------
 TG_LOOP = asyncio.new_event_loop()
 TG_CLIENT = None
 TG_CLIENT_LOCK = threading.Lock()
@@ -279,9 +270,17 @@ async def _make_client():
     return TG_CLIENT
 
 
-# ============================================================================
-# API ROUTES
-# ============================================================================
+# ----------------------------------------------------------------------------
+# API routes
+# ----------------------------------------------------------------------------
+@app.after_request
+def no_cache(resp):
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
+
 @app.route("/ping")
 def ping():
     return "pong"
@@ -291,18 +290,19 @@ def ping():
 def api_status():
     with LOG_LOCK:
         logs = list(LOGS)
+        ver = LOGS_VERSION
     return jsonify({
         "logged_in": STATE["logged_in"],
         "bot_running": STATE["bot_running"],
         "me": STATE["me"],
         "target_chat_id": STATE["target_chat_id"],
+        "logs_version": ver,
         "config": {
             "api_id": STATE["config"]["api_id"],
             "group_link": STATE["config"]["group_link"],
             "accounts": STATE["config"]["accounts"],
             "phone": STATE["config"]["phone"],
             "has_session": bool(STATE["session_string"]),
-            "has_api": bool(STATE["config"]["api_hash"]),
         },
         "logs": logs,
     })
@@ -316,12 +316,10 @@ def api_send_otp():
     phone = (data.get("phone") or "").strip()
     if not (api_id and api_hash and phone):
         return jsonify({"ok": False, "error": "Thiếu api_id / api_hash / phone"}), 400
-
     try:
         STATE["config"]["api_id"] = int(api_id)
     except Exception:
         return jsonify({"ok": False, "error": "api_id phải là số"}), 400
-
     STATE["config"]["api_hash"] = api_hash
     STATE["config"]["phone"] = phone
 
@@ -368,8 +366,7 @@ def api_verify_otp():
                             "error": "Cần mật khẩu 2FA"}
                 await cli.sign_in(password=password)
             me = await cli.get_me()
-            session_str = cli.session.save()
-            return {"ok": True, "session_string": session_str,
+            return {"ok": True, "session_string": cli.session.save(),
                     "me": {"id": me.id, "first_name": me.first_name,
                            "username": me.username}}
         except PhoneCodeInvalidError:
@@ -385,13 +382,34 @@ def api_verify_otp():
             STATE["session_string"] = res["session_string"]
             STATE["logged_in"] = True
             STATE["me"] = res["me"]
-            log(f"✅ Login Telegram OK: {res['me'].get('first_name')}", "success")
-            log(f"💡 Lưu session vào Render Env TELEGRAM_SESSION để không cần OTP lần sau", "info")
+            log(f"✅ Login OK: {res['me'].get('first_name')}", "success")
+            log("💡 Copy session ở stats bar → dán vào Render env TELEGRAM_SESSION", "info")
         else:
-            log(f"❌ Verify OTP thất bại: {res.get('error')}", "error")
+            log(f"❌ Verify OTP fail: {res.get('error')}", "error")
         return jsonify(res)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    async def _lo():
+        if TG_CLIENT:
+            try:
+                await TG_CLIENT.log_out()
+            except Exception:
+                pass
+    try:
+        run_async(_lo(), timeout=10)
+    except Exception:
+        pass
+    STATE["session_string"] = None
+    STATE["logged_in"] = False
+    STATE["me"] = None
+    STATE["target_chat_id"] = None
+    STATE["bot_running"] = False
+    log("🚪 Đã logout Telegram", "warn")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/save_config", methods=["POST"])
@@ -401,7 +419,6 @@ def api_save_config():
     accounts = data.get("accounts") or []
     if not group_link:
         return jsonify({"ok": False, "error": "Thiếu group link"}), 400
-
     clean = []
     for a in accounts:
         un = (a.get("un") or "").strip()
@@ -409,14 +426,12 @@ def api_save_config():
         nick = (a.get("nick") or un).strip()
         if un and pw:
             clean.append({"un": un, "pw": pw, "nick": nick or un})
-
     if not clean:
         return jsonify({"ok": False, "error": "Cần ít nhất 1 account game"}), 400
-
     STATE["config"]["group_link"] = group_link
     STATE["config"]["accounts"] = clean
     build_accounts()
-    log(f"💾 Đã lưu config: group={group_link}, {len(clean)} acc", "success")
+    log(f"💾 Đã lưu: {len(clean)} acc, group={group_link}", "success")
     return jsonify({"ok": True})
 
 
@@ -437,8 +452,8 @@ def api_refresh_accounts():
         for t in ts:
             t.join()
         ok = sum(1 for v in results.values() if v)
-        level = "success" if ok == len(ACCOUNT_OBJS) else "warn"
-        log(f"🔄 Refresh: {ok}/{len(ACCOUNT_OBJS)} OK", level)
+        log(f"🔄 Refresh: {ok}/{len(ACCOUNT_OBJS)} OK",
+            "success" if ok == len(ACCOUNT_OBJS) else "warn")
 
     threading.Thread(target=worker, daemon=True).start()
     return jsonify({"ok": True})
@@ -470,7 +485,6 @@ def api_start_bot():
         build_accounts()
     if not ACCOUNT_OBJS:
         return jsonify({"ok": False, "error": "Chưa có account game"}), 400
-
     STATE["bot_running"] = True
 
     def runner():
@@ -523,9 +537,9 @@ def _run_bot():
                     await TG_CLIENT.disconnect()
                 except Exception:
                     pass
-            session = StringSession(STATE["session_string"])
             TG_CLIENT = TelegramClient(
-                session, cfg["api_id"], cfg["api_hash"],
+                StringSession(STATE["session_string"]),
+                cfg["api_id"], cfg["api_hash"],
                 connection_retries=5, retry_delay=10, auto_reconnect=True,
                 request_retries=5, flood_sleep_threshold=60,
             )
@@ -534,7 +548,6 @@ def _run_bot():
         if not await TG_CLIENT.is_user_authorized():
             log("❌ Session không hợp lệ", "error")
             return
-
         try:
             entity = await TG_CLIENT.get_entity(username)
             STATE["target_chat_id"] = utils.get_peer_id(entity)
@@ -553,14 +566,11 @@ def _run_bot():
             m = re.search(r"Mã code là:\s*([A-Z0-9]+)", text)
             if not m:
                 return
-            full_code = m.group(1)
-            candidates = [full_code]
-            if full_code.endswith("LC79"):
-                candidates.append(full_code[:-4])
-            for c in candidates:
-                threading.Thread(
-                    target=redeem_all_sync, args=(c,), daemon=True
-                ).start()
+            full = m.group(1)
+            cands = [full] + ([full[:-4]] if full.endswith("LC79") else [])
+            for c in cands:
+                threading.Thread(target=redeem_all_sync, args=(c,),
+                                 daemon=True).start()
 
         log("✅ Bot online — đang chờ message...", "success")
         await TG_CLIENT.run_until_disconnected()
@@ -568,399 +578,658 @@ def _run_bot():
     run_async(bot_main(), timeout=None)
 
 
-# ============================================================================
-# FRONTEND (embedded HTML)
-# ============================================================================
+# ----------------------------------------------------------------------------
+# Frontend (embedded)
+# ----------------------------------------------------------------------------
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>🎁 LC79 Auto Redeem</title>
-<script src="https://cdn.tailwindcss.com"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#0a0e1a" />
+<meta name="format-detection" content="telephone=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<title>LC79 Auto Redeem</title>
 <style>
-  body { background: #0a0e1a; font-family: 'Segoe UI', sans-serif; }
-  .glass { background: rgba(255,255,255,0.03); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.08); }
-  .glow { box-shadow: 0 0 30px rgba(99,102,241,0.15); }
-  .log-scroll::-webkit-scrollbar { width: 6px; }
-  .log-scroll::-webkit-scrollbar-track { background: #0f172a; }
-  .log-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
-  .log-line { animation: fadeIn 0.3s ease; }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
-  .pulse-dot { animation: pulse 1.5s infinite; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-  .btn-primary { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
-  .btn-primary:hover { background: linear-gradient(135deg, #4f46e5, #7c3aed); }
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{
+  --bg:#0a0e1a;--bg2:#131a2e;--card:rgba(255,255,255,.03);--border:rgba(255,255,255,.08);
+  --text:#e2e8f0;--dim:#94a3b8;--muted:#64748b;
+  --primary:#6366f1;--primary-h:#4f46e5;
+  --success:#10b981;--danger:#ef4444;--warn:#f59e0b;
+}
+html,body{height:100%;overflow-x:hidden;-webkit-text-size-adjust:100%}
+body{
+  background:
+    radial-gradient(ellipse 80% 50% at 50% 0%,rgba(99,102,241,.15),transparent),
+    radial-gradient(ellipse 60% 40% at 80% 80%,rgba(139,92,246,.08),transparent),
+    var(--bg);
+  color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  min-height:100vh;padding-bottom:env(safe-area-inset-bottom)
+}
+button{font:inherit;cursor:pointer;border:none;outline:none;background:none;color:inherit}
+input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
+.app{max-width:1200px;margin:0 auto;padding:20px}
+@media(max-width:640px){.app{padding:12px}}
+
+/* Header */
+.header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+.brand{display:flex;align-items:center;gap:12px}
+.brand-icon{font-size:36px;filter:drop-shadow(0 4px 12px rgba(99,102,241,.5))}
+.brand h1{font-size:22px;font-weight:700;letter-spacing:-.02em;
+  background:linear-gradient(135deg,#818cf8,#c084fc);-webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;background-clip:text}
+.brand p{font-size:12px;color:var(--dim);margin-top:2px}
+.badges{display:flex;gap:8px;flex-wrap:wrap}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;
+  border-radius:999px;font-size:12px;font-weight:500;
+  background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--dim);
+  transition:all .3s}
+.badge.on{background:rgba(16,185,129,.12);border-color:rgba(16,185,129,.4);color:#6ee7b7}
+.badge .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.badge.on .dot{background:var(--success);box-shadow:0 0 8px var(--success);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+
+/* Stats */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
+@media(max-width:640px){.stats{grid-template-columns:repeat(2,1fr)}}
+.stat{background:linear-gradient(135deg,rgba(255,255,255,.04),rgba(255,255,255,.01));
+  border:1px solid var(--border);border-radius:14px;padding:14px;
+  backdrop-filter:blur(8px)}
+.stat-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.stat-value{font:600 14px/1.4 "SF Mono",Consolas,monospace;color:var(--text);margin-top:6px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stat-value.ok{color:#6ee7b7}
+.stat-value.no{color:#fca5a5}
+
+/* Grid */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.col{display:flex;flex-direction:column;gap:20px}
+
+/* Card */
+.card{background:linear-gradient(135deg,rgba(255,255,255,.04),rgba(255,255,255,.01));
+  border:1px solid var(--border);border-radius:16px;padding:20px;
+  backdrop-filter:blur(12px);box-shadow:0 4px 24px rgba(0,0,0,.2)}
+.card-title{display:flex;align-items:center;gap:8px;font-size:15px;font-weight:600;margin-bottom:16px}
+.card-title span{font-size:18px}
+.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.card-header .card-title{margin:0}
+
+/* Form */
+.field{margin-bottom:14px}
+.label{display:block;font-size:12px;font-weight:500;color:var(--dim);margin-bottom:6px}
+.input{width:100%;padding:12px 14px;font-size:16px;color:var(--text);
+  background:rgba(0,0,0,.35);border:1px solid var(--border);border-radius:10px;
+  transition:all .2s;min-height:44px}
+.input::placeholder{color:var(--muted)}
+.input:focus{outline:none;border-color:var(--primary);
+  box-shadow:0 0 0 3px rgba(99,102,241,.15);background:rgba(0,0,0,.5)}
+.input:disabled{opacity:.5;cursor:not-allowed}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  padding:12px 18px;font-size:14px;font-weight:600;border-radius:10px;
+  min-height:44px;cursor:pointer;user-select:none;white-space:nowrap;
+  transition:all .15s ease;border:none;touch-action:manipulation}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;
+  box-shadow:0 4px 14px rgba(99,102,241,.35)}
+.btn-primary:hover:not(:disabled){background:linear-gradient(135deg,#4f46e5,#7c3aed);
+  box-shadow:0 6px 20px rgba(99,102,241,.55);transform:translateY(-1px)}
+.btn-primary:active:not(:disabled){transform:translateY(0)}
+.btn-success{background:linear-gradient(135deg,#10b981,#059669);color:#fff;
+  box-shadow:0 4px 14px rgba(16,185,129,.3)}
+.btn-success:hover:not(:disabled){background:linear-gradient(135deg,#059669,#047857);transform:translateY(-1px)}
+.btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;
+  box-shadow:0 4px 14px rgba(239,68,68,.3)}
+.btn-danger:hover:not(:disabled){background:linear-gradient(135deg,#dc2626,#b91c1c);transform:translateY(-1px)}
+.btn-secondary{background:rgba(255,255,255,.06);color:var(--text);
+  border:1px solid var(--border)}
+.btn-secondary:hover:not(:disabled){background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.2)}
+.btn-block{width:100%}
+.btn-sm{padding:8px 14px;font-size:13px;min-height:38px}
+.btn-group{display:flex;gap:10px}
+.btn-group>.btn{flex:1}
+.btn-text{color:var(--dim);font-size:12px;font-weight:500;padding:4px 8px;border-radius:6px;
+  transition:all .15s}
+.btn-text:hover{color:var(--text);background:rgba(255,255,255,.05)}
+.input-group{display:flex;gap:8px}
+.input-group .input{flex:1}
+.input-group .btn{padding:12px 16px;flex-shrink:0}
+
+/* Spinner */
+.spinner{display:inline-block;width:14px;height:14px;
+  border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;
+  animation:spin .6s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Hidden */
+.hidden{display:none!important}
+
+/* Account list */
+.acc-list{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+.acc-row{display:grid;grid-template-columns:1fr 1fr 1fr 36px;gap:6px;align-items:center}
+.acc-row .input{padding:10px 10px;font-size:14px;min-height:40px}
+.acc-remove{width:36px;height:40px;display:flex;align-items:center;justify-content:center;
+  color:#fca5a5;background:rgba(239,68,68,.1);border-radius:8px;
+  transition:all .15s;font-size:16px;cursor:pointer;border:none}
+.acc-remove:hover{background:rgba(239,68,68,.25);color:#fff}
+@media(max-width:520px){.acc-row{grid-template-columns:1fr 1fr 36px}
+  .acc-row .acc-nick{grid-column:1/3}}
+
+/* Logs */
+.logs{background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.05);border-radius:10px;
+  padding:12px;height:340px;overflow-y:auto;font:11px/1.5 "SF Mono",Consolas,monospace;
+  scroll-behavior:smooth}
+.logs::-webkit-scrollbar{width:6px}
+.logs::-webkit-scrollbar-track{background:transparent}
+.logs::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:3px}
+.log-line{padding:2px 0;animation:logIn .25s ease}
+@keyframes logIn{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:translateY(0)}}
+.log-time{color:#475569;margin-right:8px}
+.log-info{color:#cbd5e1}
+.log-success{color:#6ee7b7}
+.log-error{color:#fca5a5}
+.log-warn{color:#fcd34d}
+
+/* Toast */
+.toasts{position:fixed;top:16px;right:16px;z-index:9999;display:flex;
+  flex-direction:column;gap:8px;pointer-events:none}
+@media(max-width:640px){.toasts{left:16px;right:16px}}
+.toast{pointer-events:auto;padding:12px 16px;border-radius:10px;font-size:13px;
+  font-weight:500;color:#fff;background:#1e293b;border:1px solid rgba(255,255,255,.1);
+  box-shadow:0 8px 24px rgba(0,0,0,.4);animation:toastIn .3s ease;max-width:360px}
+.toast.success{background:linear-gradient(135deg,#065f46,#064e3b);border-color:rgba(16,185,129,.5)}
+.toast.error{background:linear-gradient(135deg,#991b1b,#7f1d1d);border-color:rgba(239,68,68,.5)}
+.toast.warn{background:linear-gradient(135deg,#92400e,#78350f);border-color:rgba(245,158,11,.5)}
+@keyframes toastIn{from{transform:translateX(400px);opacity:0}to{transform:translateX(0);opacity:1}}
+
+/* Footer */
+.footer{text-align:center;font-size:12px;color:var(--muted);margin-top:32px;padding:16px 0}
 </style>
 </head>
-<body class="min-h-screen text-slate-200">
+<body>
 
-<div class="max-w-6xl mx-auto px-4 py-8">
+<div id="toasts" class="toasts"></div>
 
-  <div class="flex items-center justify-between mb-8">
-    <div>
-      <h1 class="text-3xl font-bold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">
-        🎁 LC79 Auto Redeem
-      </h1>
-      <p class="text-sm text-slate-400 mt-1">Bot tự động nhận gift code từ Telegram</p>
+<div class="app">
+
+  <header class="header">
+    <div class="brand">
+      <div class="brand-icon">🎁</div>
+      <div>
+        <h1>LC79 Auto Redeem</h1>
+        <p>Bot tự động nhận gift code từ Telegram</p>
+      </div>
     </div>
-    <div class="flex gap-2">
-      <span id="badgeLogin" class="px-3 py-1.5 rounded-full text-xs font-medium bg-slate-700/50 border border-slate-600/50">⚪ Chưa login</span>
-      <span id="badgeBot" class="px-3 py-1.5 rounded-full text-xs font-medium bg-slate-700/50 border border-slate-600/50">⚪ Bot tắt</span>
+    <div class="badges">
+      <div class="badge" id="badge-login"><span class="dot"></span><span class="txt">Chưa login</span></div>
+      <div class="badge" id="badge-bot"><span class="dot"></span><span class="txt">Bot tắt</span></div>
+    </div>
+  </header>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-label">Telegram</div>
+      <div class="stat-value" id="stat-user">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Group ID</div>
+      <div class="stat-value" id="stat-group">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Accounts</div>
+      <div class="stat-value" id="stat-acc">0</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Session</div>
+      <div class="stat-value" id="stat-session">❌</div>
     </div>
   </div>
 
-  <div class="glass glow rounded-2xl p-4 mb-6 grid grid-cols-2 md:grid-cols-4 gap-4">
-    <div>
-      <div class="text-xs text-slate-400">Telegram</div>
-      <div id="statUser" class="text-sm font-mono mt-1 text-slate-300">—</div>
-    </div>
-    <div>
-      <div class="text-xs text-slate-400">Group ID</div>
-      <div id="statGroup" class="text-sm font-mono mt-1 text-slate-300">—</div>
-    </div>
-    <div>
-      <div class="text-xs text-slate-400">Accounts</div>
-      <div id="statAcc" class="text-sm font-mono mt-1 text-slate-300">—</div>
-    </div>
-    <div>
-      <div class="text-xs text-slate-400">Session</div>
-      <div id="statSession" class="text-sm font-mono mt-1 text-slate-300">—</div>
-    </div>
-  </div>
+  <div class="grid">
+    <div class="col">
 
-  <div class="grid md:grid-cols-2 gap-6">
+      <!-- Login card -->
+      <div class="card">
+        <h2 class="card-title"><span>🔐</span> Đăng nhập Telegram</h2>
 
-    <div class="space-y-6">
-
-      <div id="cardLogin" class="glass rounded-2xl p-6">
-        <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
-          <span>🔐</span> Đăng nhập Telegram
-        </h2>
-
-        <div id="loginStep1" class="space-y-3">
-          <input id="apiId" type="number" placeholder="api_id (VD: 34425014)"
-                 class="w-full bg-slate-900/70 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-500" />
-          <input id="apiHash" type="text" placeholder="api_hash"
-                 class="w-full bg-slate-900/70 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-500" />
-          <input id="phone" type="text" placeholder="Số điện thoại (+84...)"
-                 class="w-full bg-slate-900/70 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-500" />
-          <button onclick="sendOTP()"
-                  class="btn-primary w-full text-white font-medium rounded-lg py-2.5 text-sm transition">
+        <div id="step1">
+          <div class="field">
+            <label class="label">API ID</label>
+            <input id="apiId" type="number" class="input" placeholder="VD: 34425014" inputmode="numeric" />
+          </div>
+          <div class="field">
+            <label class="label">API Hash</label>
+            <input id="apiHash" type="text" class="input" placeholder="Nhập api_hash" autocomplete="off" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label class="label">Số điện thoại</label>
+            <input id="phone" type="tel" class="input" placeholder="+84..." inputmode="tel" autocomplete="tel" />
+          </div>
+          <button type="button" class="btn btn-primary btn-block" onclick="sendOTP(this)">
             📱 Gửi mã OTP
           </button>
         </div>
 
-        <div id="loginStep2" class="hidden space-y-3">
-          <input id="otpCode" type="text" placeholder="Mã OTP (VD: 12345)"
-                 class="w-full bg-slate-900/70 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-500" />
-          <input id="otpPassword" type="password" placeholder="Mật khẩu 2FA (nếu có)"
-                 class="w-full bg-slate-900/70 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-500" />
-          <div class="flex gap-2">
-            <button onclick="verifyOTP()"
-                    class="btn-primary flex-1 text-white font-medium rounded-lg py-2.5 text-sm">
-              ✅ Xác nhận
-            </button>
-            <button onclick="backToLogin1()"
-                    class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-lg py-2.5 text-sm">
-              ← Quay lại
-            </button>
+        <div id="step2" class="hidden">
+          <div class="field">
+            <label class="label">Mã OTP</label>
+            <input id="otpCode" type="text" class="input" placeholder="Nhập mã OTP" inputmode="numeric" autocomplete="one-time-code" />
           </div>
+          <div class="field">
+            <label class="label">Mật khẩu 2FA (nếu có)</label>
+            <input id="otpPassword" type="password" class="input" placeholder="Để trống nếu không có" />
+          </div>
+          <div class="btn-group">
+            <button type="button" class="btn btn-secondary" onclick="showStep1()">← Quay lại</button>
+            <button type="button" class="btn btn-primary" onclick="verifyOTP(this)">✅ Xác nhận</button>
+          </div>
+        </div>
+
+        <div id="loggedIn" class="hidden">
+          <p style="color:var(--dim);font-size:13px;margin-bottom:12px">
+            ✅ Đã đăng nhập. Session được lưu server — không cần nhập lại nếu restart (thêm env).
+          </p>
+          <button type="button" class="btn btn-secondary btn-block" onclick="logout(this)">
+            🚪 Đăng xuất
+          </button>
         </div>
       </div>
 
-      <div id="cardConfig" class="glass rounded-2xl p-6">
-        <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
-          <span>⚙️</span> Cấu hình
-        </h2>
-
-        <label class="text-xs text-slate-400 mb-1 block">Link group Telegram</label>
-        <input id="groupLink" type="text" placeholder="https://t.me/codelaucuagame"
-               class="w-full bg-slate-900/70 border border-slate-700 rounded-lg px-4 py-2.5 text-sm mb-4 focus:outline-none focus:border-indigo-500" />
-
-        <label class="text-xs text-slate-400 mb-2 block">Accounts game LC79</label>
-        <div id="accountList" class="space-y-2 mb-3"></div>
-
-        <button onclick="addAccount()"
-                class="w-full border border-dashed border-slate-600 hover:border-indigo-500 text-slate-400 hover:text-indigo-400 rounded-lg py-2 text-sm mb-3 transition">
-          ➕ Thêm account
-        </button>
-
-        <button onclick="saveConfig()"
-                class="btn-primary w-full text-white font-medium rounded-lg py-2.5 text-sm">
+      <!-- Config card -->
+      <div class="card">
+        <h2 class="card-title"><span>⚙️</span> Cấu hình</h2>
+        <div class="field">
+          <label class="label">Link group Telegram</label>
+          <input id="groupLink" type="text" class="input" placeholder="https://t.me/codelaucuagame" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label class="label">Accounts game LC79</label>
+          <div id="accountList" class="acc-list"></div>
+          <button type="button" class="btn btn-secondary btn-block btn-sm" onclick="addAccount()">
+            ➕ Thêm account
+          </button>
+        </div>
+        <button type="button" class="btn btn-primary btn-block" onclick="saveConfig(this)">
           💾 Lưu cấu hình
         </button>
       </div>
     </div>
 
-    <div class="space-y-6">
+    <div class="col">
 
-      <div class="glass rounded-2xl p-6">
-        <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
-          <span>🎮</span> Điều khiển
-        </h2>
-
-        <div class="grid grid-cols-2 gap-3 mb-3">
-          <button onclick="startBot()"
-                  class="bg-emerald-600 hover:bg-emerald-500 text-white font-medium rounded-lg py-2.5 text-sm transition">
-            ▶️ Start Bot
-          </button>
-          <button onclick="stopBot()"
-                  class="bg-rose-600 hover:bg-rose-500 text-white font-medium rounded-lg py-2.5 text-sm transition">
-            ⏹ Stop Bot
-          </button>
+      <!-- Control card -->
+      <div class="card">
+        <h2 class="card-title"><span>🎮</span> Điều khiển</h2>
+        <div class="btn-group" style="margin-bottom:12px">
+          <button type="button" class="btn btn-success" onclick="startBot(this)">▶️ Start Bot</button>
+          <button type="button" class="btn btn-danger" onclick="stopBot(this)">⏹ Stop Bot</button>
         </div>
-
-        <button onclick="refreshAccounts()"
-                class="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium rounded-lg py-2.5 text-sm mb-3">
+        <button type="button" class="btn btn-secondary btn-block" style="margin-bottom:12px" onclick="refreshAccounts(this)">
           🔄 Refresh Accounts
         </button>
-
-        <div class="flex gap-2">
-          <input id="manualCode" type="text" placeholder="Nhập code để redeem thủ công..."
-                 class="flex-1 bg-slate-900/70 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-indigo-500" />
-          <button onclick="manualRedeem()"
-                  class="btn-primary text-white font-medium rounded-lg px-4 text-sm">
-            🚀
-          </button>
+        <div class="input-group">
+          <input id="manualCode" type="text" class="input" placeholder="Nhập code redeem thủ công..." autocomplete="off" />
+          <button type="button" class="btn btn-primary" onclick="manualRedeem(this)">🚀</button>
         </div>
       </div>
 
-      <div class="glass rounded-2xl p-6">
-        <div class="flex items-center justify-between mb-3">
-          <h2 class="text-lg font-semibold flex items-center gap-2">
-            <span>📜</span> Logs
-          </h2>
-          <button onclick="clearLogs()" class="text-xs text-slate-500 hover:text-slate-300">Xoá</button>
+      <!-- Logs card -->
+      <div class="card">
+        <div class="card-header">
+          <h2 class="card-title"><span>📜</span> Logs</h2>
+          <button type="button" class="btn-text" onclick="clearLogs()">Xoá</button>
         </div>
-        <div id="logViewer"
-             class="log-scroll bg-slate-950/80 rounded-lg p-3 h-96 overflow-y-auto text-xs font-mono space-y-0.5"></div>
+        <div id="logs" class="logs"></div>
       </div>
     </div>
   </div>
 
-  <p class="text-center text-xs text-slate-600 mt-8">
-    LC79 Auto Redeem • Web Edition
-  </p>
+  <footer class="footer">LC79 Auto Redeem • Web Edition</footer>
 </div>
 
 <script>
-let lastLogCount = 0;
+"use strict";
+
+// ============ STATE ============
+let lastLogVer = -1;
 let autoScroll = true;
 
+// ============ TOAST ============
+function toast(msg, level) {
+  const box = document.getElementById("toasts");
+  const el = document.createElement("div");
+  el.className = "toast " + (level || "info");
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => {
+    el.style.transition = "opacity .3s, transform .3s";
+    el.style.opacity = "0";
+    el.style.transform = "translateX(400px)";
+    setTimeout(() => el.remove(), 300);
+  }, 3500);
+}
+
+// ============ LOADING ============
+function setLoading(btn, loading, text) {
+  if (!btn) return;
+  if (loading) {
+    btn.dataset.orig = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> ' + (text || "Đang xử lý...");
+  } else {
+    btn.disabled = false;
+    if (btn.dataset.orig) btn.innerHTML = btn.dataset.orig;
+  }
+}
+
+// ============ API ============
+async function api(url, body) {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    return await res.json();
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+// ============ LOCAL STORAGE ============
 function saveLocal() {
-  const data = {
-    apiId: document.getElementById('apiId').value,
-    apiHash: document.getElementById('apiHash').value,
-    phone: document.getElementById('phone').value,
-    groupLink: document.getElementById('groupLink').value,
-    accounts: getAccountsFromUI(),
-  };
-  localStorage.setItem('lc79_config', JSON.stringify(data));
+  try {
+    localStorage.setItem("lc79_cfg", JSON.stringify({
+      apiId: val("apiId"),
+      apiHash: val("apiHash"),
+      phone: val("phone"),
+      groupLink: val("groupLink"),
+      accounts: getAccounts(),
+    }));
+  } catch (e) {}
 }
 
 function loadLocal() {
   try {
-    const d = JSON.parse(localStorage.getItem('lc79_config') || '{}');
-    if (d.apiId) document.getElementById('apiId').value = d.apiId;
-    if (d.apiHash) document.getElementById('apiHash').value = d.apiHash;
-    if (d.phone) document.getElementById('phone').value = d.phone;
-    if (d.groupLink) document.getElementById('groupLink').value = d.groupLink;
-    if (d.accounts && d.accounts.length) {
-      d.accounts.forEach(a => addAccount(a.un, a.pw, a.nick));
-    }
-  } catch(e) {}
+    const d = JSON.parse(localStorage.getItem("lc79_cfg") || "{}");
+    if (d.apiId) document.getElementById("apiId").value = d.apiId;
+    if (d.apiHash) document.getElementById("apiHash").value = d.apiHash;
+    if (d.phone) document.getElementById("phone").value = d.phone;
+    if (d.groupLink) document.getElementById("groupLink").value = d.groupLink;
+    (d.accounts || []).forEach(a => addAccount(a.un, a.pw, a.nick));
+  } catch (e) {}
 }
 
-function addAccount(un='', pw='', nick='') {
-  const div = document.createElement('div');
-  div.className = 'flex gap-2 account-item';
-  div.innerHTML = `
-    <input type="text" placeholder="Username" value="${escape(un)}"
-           class="acc-un flex-1 bg-slate-900/70 border border-slate-700 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-indigo-500" />
-    <input type="password" placeholder="Password" value="${escape(pw)}"
-           class="acc-pw flex-1 bg-slate-900/70 border border-slate-700 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-indigo-500" />
-    <input type="text" placeholder="Nick" value="${escape(nick)}"
-           class="acc-nick flex-1 bg-slate-900/70 border border-slate-700 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-indigo-500" />
-    <button onclick="this.parentElement.remove()"
-            class="text-rose-400 hover:text-rose-300 px-2">✖</button>
-  `;
-  document.getElementById('accountList').appendChild(div);
+function val(id) {
+  const el = document.getElementById(id);
+  return el ? el.value.trim() : "";
 }
 
-function getAccountsFromUI() {
-  const items = document.querySelectorAll('.account-item');
+// ============ ACCOUNTS ============
+function addAccount(un, pw, nick) {
+  un = un || ""; pw = pw || ""; nick = nick || "";
+  const row = document.createElement("div");
+  row.className = "acc-row";
+  row.innerHTML =
+    '<input type="text" class="input acc-un" placeholder="Username" autocomplete="off" spellcheck="false">' +
+    '<input type="password" class="input acc-pw" placeholder="Password" autocomplete="new-password">' +
+    '<input type="text" class="input acc-nick" placeholder="Nick (tùy chọn)" autocomplete="off" spellcheck="false">' +
+    '<button type="button" class="acc-remove" title="Xoá">✖</button>';
+  row.querySelector(".acc-un").value = un;
+  row.querySelector(".acc-pw").value = pw;
+  row.querySelector(".acc-nick").value = nick;
+  row.querySelector(".acc-remove").onclick = () => row.remove();
+  document.getElementById("accountList").appendChild(row);
+}
+
+function getAccounts() {
   const out = [];
-  items.forEach(it => {
-    const un = it.querySelector('.acc-un').value.trim();
-    const pw = it.querySelector('.acc-pw').value.trim();
-    const nick = it.querySelector('.acc-nick').value.trim() || un;
+  document.querySelectorAll(".acc-row").forEach(r => {
+    const un = r.querySelector(".acc-un").value.trim();
+    const pw = r.querySelector(".acc-pw").value.trim();
+    const nick = r.querySelector(".acc-nick").value.trim() || un;
     if (un && pw) out.push({ un, pw, nick });
   });
   return out;
 }
 
-function escape(s) {
-  return String(s || '').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+// ============ LOGIN FLOW ============
+function showStep1() {
+  document.getElementById("step1").classList.remove("hidden");
+  document.getElementById("step2").classList.add("hidden");
 }
 
-async function sendOTP() {
-  const api_id = document.getElementById('apiId').value;
-  const api_hash = document.getElementById('apiHash').value;
-  const phone = document.getElementById('phone').value;
-  if (!api_id || !api_hash || !phone) return alert('Điền đủ 3 field');
+function showStep2() {
+  document.getElementById("step1").classList.add("hidden");
+  document.getElementById("step2").classList.remove("hidden");
+}
+
+function showLoggedIn() {
+  document.getElementById("step1").classList.add("hidden");
+  document.getElementById("step2").classList.add("hidden");
+  document.getElementById("loggedIn").classList.remove("hidden");
+}
+
+async function sendOTP(btn) {
+  const api_id = val("apiId");
+  const api_hash = val("apiHash");
+  const phone = val("phone");
+  if (!api_id || !api_hash || !phone) {
+    toast("Vui lòng điền đủ 3 field", "error");
+    return;
+  }
+  setLoading(btn, true, "Đang gửi OTP...");
   saveLocal();
-  const r = await api('/api/send_otp', { api_id, api_hash, phone });
-  if (r.ok) {
-    document.getElementById('loginStep1').classList.add('hidden');
-    document.getElementById('loginStep2').classList.remove('hidden');
-  } else {
-    alert('Lỗi: ' + (r.error || 'unknown'));
+  try {
+    const r = await api("/api/send_otp", { api_id, api_hash, phone });
+    if (r.ok) {
+      toast("Đã gửi OTP tới " + phone, "success");
+      showStep2();
+    } else {
+      toast(r.error || "Lỗi không xác định", "error");
+    }
+  } finally {
+    setLoading(btn, false);
   }
 }
 
-async function verifyOTP() {
-  const code = document.getElementById('otpCode').value.trim();
-  const password = document.getElementById('otpPassword').value;
-  if (!code) return alert('Nhập OTP');
-  const r = await api('/api/verify_otp', { code, password });
-  if (r.ok) {
-    document.getElementById('loginStep1').classList.remove('hidden');
-    document.getElementById('loginStep2').classList.add('hidden');
-    document.getElementById('otpCode').value = '';
-    document.getElementById('otpPassword').value = '';
-  } else if (r.need_password) {
-    alert('Cần mật khẩu 2FA');
-  } else {
-    alert('Lỗi: ' + (r.error || 'unknown'));
+async function verifyOTP(btn) {
+  const code = val("otpCode");
+  const password = document.getElementById("otpPassword").value;
+  if (!code) {
+    toast("Nhập OTP trước", "error");
+    return;
+  }
+  setLoading(btn, true, "Đang xác nhận...");
+  try {
+    const r = await api("/api/verify_otp", { code, password });
+    if (r.ok) {
+      toast("✅ Đăng nhập thành công!", "success");
+      showLoggedIn();
+      document.getElementById("otpCode").value = "";
+      document.getElementById("otpPassword").value = "";
+    } else if (r.need_password) {
+      toast("Cần mật khẩu 2FA", "warn");
+    } else {
+      toast(r.error || "OTP sai", "error");
+    }
+  } finally {
+    setLoading(btn, false);
   }
 }
 
-function backToLogin1() {
-  document.getElementById('loginStep1').classList.remove('hidden');
-  document.getElementById('loginStep2').classList.add('hidden');
-}
-
-async function saveConfig() {
-  const group_link = document.getElementById('groupLink').value.trim();
-  const accounts = getAccountsFromUI();
-  if (!group_link) return alert('Nhập link group');
-  if (!accounts.length) return alert('Thêm ít nhất 1 account');
-  const r = await api('/api/save_config', { group_link, accounts });
-  if (r.ok) {
-    saveLocal();
-    alert('✅ Đã lưu cấu hình');
-  } else {
-    alert('Lỗi: ' + (r.error || 'unknown'));
+async function logout(btn) {
+  if (!confirm("Đăng xuất Telegram?")) return;
+  setLoading(btn, true, "Đang logout...");
+  try {
+    const r = await api("/api/logout", {});
+    if (r.ok) {
+      toast("Đã logout", "warn");
+      showStep1();
+    }
+  } finally {
+    setLoading(btn, false);
   }
 }
 
-async function startBot() {
-  const r = await api('/api/start_bot', {});
-  if (!r.ok) alert('Lỗi: ' + (r.error || 'unknown'));
+// ============ CONFIG ============
+async function saveConfig(btn) {
+  const group_link = val("groupLink");
+  const accounts = getAccounts();
+  if (!group_link) { toast("Nhập link group", "error"); return; }
+  if (!accounts.length) { toast("Cần ít nhất 1 account", "error"); return; }
+  setLoading(btn, true, "Đang lưu...");
+  try {
+    const r = await api("/api/save_config", { group_link, accounts });
+    if (r.ok) {
+      toast("✅ Đã lưu cấu hình", "success");
+      saveLocal();
+    } else {
+      toast(r.error || "Lỗi lưu", "error");
+    }
+  } finally {
+    setLoading(btn, false);
+  }
 }
 
-async function stopBot() {
-  await api('/api/stop_bot', {});
+// ============ CONTROL ============
+async function startBot(btn) {
+  setLoading(btn, true, "Đang start...");
+  try {
+    const r = await api("/api/start_bot", {});
+    if (r.ok) toast("Đang khởi động bot...", "success");
+    else toast(r.error || "Lỗi", "error");
+  } finally {
+    setLoading(btn, false);
+  }
 }
 
-async function refreshAccounts() {
-  await api('/api/refresh_accounts', {});
+async function stopBot(btn) {
+  if (!confirm("Dừng bot?")) return;
+  setLoading(btn, true, "Đang dừng...");
+  try {
+    await api("/api/stop_bot", {});
+    toast("Đã gửi lệnh dừng", "warn");
+  } finally {
+    setLoading(btn, false);
+  }
 }
 
-async function manualRedeem() {
-  const code = document.getElementById('manualCode').value.trim();
-  if (!code) return;
-  const r = await api('/api/manual_redeem', { code });
-  if (r.ok) {
-    document.getElementById('manualCode').value = '';
-  } else {
-    alert('Lỗi: ' + (r.error || 'unknown'));
+async function refreshAccounts(btn) {
+  setLoading(btn, true, "Đang refresh...");
+  try {
+    const r = await api("/api/refresh_accounts", {});
+    if (!r.ok) toast(r.error || "Lỗi", "error");
+    else toast("Đang refresh accounts...", "success");
+  } finally {
+    setTimeout(() => setLoading(btn, false), 800);
+  }
+}
+
+async function manualRedeem(btn) {
+  const code = val("manualCode").toUpperCase();
+  if (!code) { toast("Nhập code", "error"); return; }
+  setLoading(btn, true, "");
+  try {
+    const r = await api("/api/manual_redeem", { code });
+    if (r.ok) {
+      toast("Đang redeem: " + code, "success");
+      document.getElementById("manualCode").value = "";
+    } else {
+      toast(r.error || "Lỗi", "error");
+    }
+  } finally {
+    setLoading(btn, false);
   }
 }
 
 function clearLogs() {
-  document.getElementById('logViewer').innerHTML = '';
-  lastLogCount = 0;
+  document.getElementById("logs").innerHTML = "";
+  lastLogVer = -1;
 }
 
-async function api(url, body) {
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body || {}),
-    });
-    return await res.json();
-  } catch(e) {
-    return { ok: false, error: String(e) };
-  }
-}
-
+// ============ POLL ============
 async function poll() {
   try {
-    const res = await fetch('/api/status');
+    const res = await fetch("/api/status", { cache: "no-store" });
     const d = await res.json();
 
-    const bl = document.getElementById('badgeLogin');
-    if (d.logged_in) {
-      bl.textContent = '🟢 Đã login';
-      bl.className = 'px-3 py-1.5 rounded-full text-xs font-medium bg-emerald-900/40 text-emerald-300 border border-emerald-700/50';
-    } else {
-      bl.textContent = '⚪ Chưa login';
-      bl.className = 'px-3 py-1.5 rounded-full text-xs font-medium bg-slate-700/50 border border-slate-600/50';
-    }
-    const bb = document.getElementById('badgeBot');
-    if (d.bot_running) {
-      bb.innerHTML = '<span class="pulse-dot">🟢</span> Bot online';
-      bb.className = 'px-3 py-1.5 rounded-full text-xs font-medium bg-emerald-900/40 text-emerald-300 border border-emerald-700/50';
-    } else {
-      bb.textContent = '⚪ Bot tắt';
-      bb.className = 'px-3 py-1.5 rounded-full text-xs font-medium bg-slate-700/50 border border-slate-600/50';
+    // Badges
+    setBadge("badge-login", d.logged_in, d.logged_in ? "Đã login" : "Chưa login");
+    setBadge("badge-bot", d.bot_running, d.bot_running ? "Bot online" : "Bot tắt");
+
+    // Login/logout card state
+    if (d.logged_in) showLoggedIn();
+    else {
+      const s1 = document.getElementById("step1");
+      const s2 = document.getElementById("step2");
+      const li = document.getElementById("loggedIn");
+      if (s1.classList.contains("hidden") && li.classList.contains("hidden")) {
+        // đang ở step2 → giữ nguyên
+      } else if (li && !li.classList.contains("hidden")) {
+        s1.classList.remove("hidden");
+        li.classList.add("hidden");
+      }
     }
 
-    document.getElementById('statUser').textContent = d.me ? (d.me.first_name || d.me.username || '?') : '—';
-    document.getElementById('statGroup').textContent = d.target_chat_id || '—';
-    document.getElementById('statAcc').textContent = (d.config.accounts || []).length + ' acc';
-    document.getElementById('statSession').textContent = d.config.has_session ? '✅ Có' : '❌ Chưa';
+    // Stats
+    setStat("stat-user", d.me ? (d.me.first_name || d.me.username || "?") : "—");
+    setStat("stat-group", d.target_chat_id || "—");
+    setStat("stat-acc", (d.config.accounts || []).length + " acc");
+    const ss = document.getElementById("stat-session");
+    ss.textContent = d.config.has_session ? "✅ Có" : "❌ Chưa";
+    ss.className = "stat-value " + (d.config.has_session ? "ok" : "no");
 
-    renderLogs(d.logs || []);
-  } catch(e) {}
+    // Logs
+    if (d.logs_version !== lastLogVer) {
+      lastLogVer = d.logs_version;
+      renderLogs(d.logs || []);
+    }
+  } catch (e) {}
+}
+
+function setBadge(id, on, text) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.toggle("on", !!on);
+  const t = el.querySelector(".txt");
+  if (t) t.textContent = text;
+}
+
+function setStat(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
 }
 
 function renderLogs(logs) {
-  const viewer = document.getElementById('logViewer');
-  if (logs.length === lastLogCount) return;
-  lastLogCount = logs.length;
-
-  const colorFor = (level) => {
-    if (level === 'success') return 'text-emerald-400';
-    if (level === 'error') return 'text-rose-400';
-    if (level === 'warn') return 'text-amber-400';
-    return 'text-slate-300';
-  };
-
+  const viewer = document.getElementById("logs");
+  const cls = { success: "log-success", error: "log-error", warn: "log-warn" };
   viewer.innerHTML = logs.map(l =>
-    `<div class="log-line ${colorFor(l.level)}"><span class="text-slate-600">${l.ts}</span>  ${escapeHtml(l.msg)}</div>`
-  ).join('');
-
+    '<div class="log-line ' + (cls[l.level] || "log-info") + '">' +
+    '<span class="log-time">' + escapeHtml(l.ts) + '</span>' +
+    escapeHtml(l.msg) + '</div>'
+  ).join("");
   if (autoScroll) viewer.scrollTop = viewer.scrollHeight;
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
 }
 
+// ============ INIT ============
 loadLocal();
-if (document.querySelectorAll('.account-item').length === 0) {
-  addAccount();
-}
+if (document.querySelectorAll(".acc-row").length === 0) addAccount();
 poll();
 setInterval(poll, 1500);
 
-const logViewer = document.getElementById('logViewer');
-logViewer.addEventListener('scroll', () => {
-  autoScroll = logViewer.scrollTop + logViewer.clientHeight >= logViewer.scrollHeight - 20;
+const viewer = document.getElementById("logs");
+viewer.addEventListener("scroll", () => {
+  autoScroll = viewer.scrollTop + viewer.clientHeight >= viewer.scrollHeight - 20;
 });
 </script>
 </body>
@@ -973,9 +1242,9 @@ def index():
     return Response(HTML_PAGE, mimetype="text/html")
 
 
-# ============================================================================
-# BOOT
-# ============================================================================
+# ----------------------------------------------------------------------------
+# Boot
+# ----------------------------------------------------------------------------
 start_tg_loop()
 
 if os.environ.get("TELEGRAM_SESSION"):
