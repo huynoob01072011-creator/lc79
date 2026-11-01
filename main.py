@@ -1,1298 +1,988 @@
-"""
-🤖 AI TÀI XỈU ULTRA V5 — FLASK LIVE WEB
-35 Cores · Regime Detection · Confidence Scoring · Realtime Push
-Chạy: python app.py  →  http://localhost:5000  (admin / admin123)
-"""
-
-import os, json, hashlib, base64, logging, threading, time, random, math, itertools
-from functools import wraps
-
+from flask import Flask, render_template_string, request, jsonify
 import requests
-import socketio as sio_client
-from flask import Flask, request, jsonify, session, redirect
-from flask_socketio import SocketIO, emit, join_room
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-logging.getLogger('engineio').setLevel(logging.WARNING)
-logging.getLogger('urllib3').setLevel(logging.WARNING)
+import hashlib
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'CHANGE-ME-PROD-SECRET-KEY-123')
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-web_socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading',
-                        ping_timeout=30, ping_interval=10)
 
-# ==========================================
-# CONFIG
-# ==========================================
-DATA_COLLECTOR_USER = "acc_clone_soi_cau"
-DATA_COLLECTOR_PASS = "matkhau123"
-USERS_FILE = "users.json"
-
-def hash_pw(p): return hashlib.sha256(p.encode()).hexdigest()
-
-def load_users():
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE) as f: return json.load(f)
-        except Exception: pass
-    default = {"admin": {"password": hash_pw("admin123"), "is_admin": True, "is_vip": True}}
-    with open(USERS_FILE, 'w') as f: json.dump(default, f, indent=2)
-    return default
-
-def save_users(u):
-    with open(USERS_FILE, 'w') as f: json.dump(u, f, indent=2)
-
-USERS = load_users()
-active_sockets = {}
-user_states = {}
-state_lock = threading.Lock()
-
-# ==========================================
-# GLOBAL DATA & 35 AI CORES
-# ==========================================
-GLOBAL_HISTORY = []
-MAX_GLOBAL_HISTORY = 2000
-
-GLOBAL_AI_WEIGHTS = {
-    "trend": 1.0, "pattern": 1.0, "frequency": 1.0, "momentum": 1.0, "symmetry": 1.0,
-    "alternating": 1.0, "fibonacci": 1.0, "chaos": 1.0, "shadow": 1.0,
-    "markov1": 1.0, "markov2": 1.0, "markov3": 1.0,
-    "rsi_indicator": 1.0, "macd_cross": 1.0, "pivot_reversal": 1.0, "cluster_3": 1.0,
-    "parity": 1.0, "golden_ratio": 1.0, "quantum": 1.0,
-    "anti_bait": 2.0, "smart_breaker": 2.0,
-    "ngram_4": 1.5, "ngram_5": 1.5, "elliott_wave": 1.5, "contrarian": 2.0,
-    "bollinger_bands": 1.5, "mean_reversion": 1.0, "mirror_reflection": 1.0,
-    "martingale_trap": 1.5, "poisson_prob": 1.0, "harmonic_cycle": 1.0,
-    "breakout_hunter": 1.5, "volume_fakeout": 1.5, "time_decay": 1.0,
-    "neural_bias": 1.0, "twin_peaks": 1.0
-}
-GLOBAL_MODEL_STREAK = {k: 0 for k in GLOBAL_AI_WEIGHTS.keys()}
-
-def init_user_state(user_id):
-    with state_lock:
-        if user_id not in user_states:
-            user_states[user_id] = {
-                "profit_loss": 0, "auto_bet_enabled": False, "x2_mode": False,
-                "win_streak": 0, "base_bet_amount": 10000, "current_bet": 10000,
-                "target_profit": None, "current_prediction": None, "current_confidence": 0,
-                "current_top_models": [], "waiting_for_result": False,
-                "has_bet_this_session": False, "session_id": None, "balance": 0,
-                "last_predictions": {}, "min_confidence": 50,
-                "pred_total": 0, "pred_correct": 0,
-                "history_tail": [], "regime": "unknown"
-            }
-
-def send_msg(user_id, text):
-    web_socketio.emit('bot_message', {'text': text, 'ts': time.time()},
-                      room=f"user_{user_id}")
-
-def send_state(user_id):
-    with state_lock:
-        if user_id not in user_states: return
-        s = user_states[user_id]
-        payload = {
-            "prediction": s["current_prediction"], "confidence": s["current_confidence"],
-            "top_models": s["current_top_models"], "balance": s["balance"],
-            "profit_loss": s["profit_loss"], "win_streak": s["win_streak"],
-            "session_id": s["session_id"], "auto_bet": s["auto_bet_enabled"],
-            "x2_mode": s["x2_mode"], "pred_total": s["pred_total"],
-            "pred_correct": s["pred_correct"], "regime": s["regime"],
-            "history_tail": s["history_tail"][-50:], "min_confidence": s["min_confidence"],
-            "target_profit": s["target_profit"],
-        }
-    web_socketio.emit('state_update', payload, room=f"user_{user_id}")
-
-# ==========================================
-# REGIME DETECTION
-# ==========================================
-def detect_regime(recent_str):
-    if len(recent_str) < 20: return "unknown"
-    recent = recent_str[-20:]
-    max_streak = max(len(list(g)) for _, g in itertools.groupby(recent))
-    alt_count = sum(1 for i in range(len(recent) - 1) if recent[i] != recent[i+1])
-    alt_ratio = alt_count / (len(recent) - 1)
-    if max_streak >= 6: return "streak"
-    if alt_ratio >= 0.75: return "alternating"
-    if max_streak >= 4: return "short_streak"
-    return "chaos"
-
-REGIME_BOOST = {
-    "streak":       {"anti_bait": 1.6, "smart_breaker": 1.6, "breakout_hunter": 1.4,
-                     "martingale_trap": 1.4, "contrarian": 1.3, "bollinger_bands": 1.3},
-    "alternating":  {"alternating": 2.2, "symmetry": 1.6, "parity": 1.6, "pattern": 1.4,
-                     "mirror_reflection": 1.3},
-    "short_streak": {"elliott_wave": 1.5, "twin_peaks": 1.4, "cluster_3": 1.3,
-                     "harmonic_cycle": 1.3, "pivot_reversal": 1.2},
-    "chaos":        {"ngram_4": 1.7, "ngram_5": 1.7, "quantum": 1.4, "chaos": 1.4,
-                     "time_decay": 1.3, "frequency": 1.2},
-}
-
-# ==========================================
-# 35-CORE PREDICTION
-# ==========================================
-def make_prediction_vip(user_id):
-    with state_lock:
-        state = user_states[user_id]
-        history = list(GLOBAL_HISTORY)
-        weights = dict(GLOBAL_AI_WEIGHTS)
-    n = len(history)
-    if n < 10:
-        return None, 0, []
-
-    last_item = history[-1]
-    opp_item = "XIU" if last_item == "TAI" else "TAI"
-    recent_str = "".join("T" if x == "TAI" else "X" for x in history)
-    streak = len(recent_str) - len(recent_str.rstrip(recent_str[-1]))
-    regime = detect_regime(recent_str)
-    boost = REGIME_BOOST.get(regime, {})
-    preds = {}
-
-    preds["trend"] = last_item if history[-5:].count(last_item) >= 3 else opp_item
-    preds["pattern"] = opp_item if recent_str.endswith(("TXTX", "TTXX")) else last_item
-    t1 = {"TAI": {"TAI": 0, "XIU": 0}, "XIU": {"TAI": 0, "XIU": 0}}
-    for i in range(n - 1): t1[history[i]][history[i+1]] += 1
-    preds["markov1"] = "TAI" if t1[last_item]["TAI"] > t1[last_item]["XIU"] else "XIU"
-    preds["markov2"] = "TAI" if history[-2:] == ["TAI", "TAI"] else "XIU"
-    preds["markov3"] = opp_item if history[-3:] == [last_item]*3 else preds["markov2"]
-    preds["frequency"] = "XIU" if history[-20:].count("TAI") > 10 else "TAI"
-    preds["momentum"] = "TAI" if sum((i+1) * (1 if r == "TAI" else -1) for i, r in enumerate(history[-5:])) > 0 else "XIU"
-    preds["symmetry"] = opp_item if len(recent_str) >= 6 and recent_str[-6:-3] == recent_str[-3:][::-1] else last_item
-    preds["alternating"] = opp_item
-    preds["fibonacci"] = opp_item if streak in (3, 5, 8, 13) else last_item
-    preds["chaos"] = opp_item if sum(1 for i in range(9) if recent_str[-10:][i] != recent_str[-10:][i+1]) >= 7 else last_item
-    preds["shadow"] = "TAI" if history[-50:].count("TAI") < 25 else "XIU"
-    rsi = recent_str[-10:].count("T")
-    preds["rsi_indicator"] = "XIU" if rsi >= 7 else ("TAI" if rsi <= 3 else last_item)
-    preds["macd_cross"] = "TAI" if recent_str[-3:].count("T") > (recent_str[-9:].count("T") / 3) else "XIU"
-    preds["pivot_reversal"] = history[-1] if history[-3] == history[-2] and history[-2] != history[-1] else last_item
-    preds["cluster_3"] = "TAI" if recent_str[-3:] in ("TTT", "TXX", "XTX", "XXT") else "XIU"
-    preds["parity"] = opp_item if streak % 2 == 0 else last_item
-    preds["golden_ratio"] = "TAI" if (history[-30:].count("TAI") / 30) < 0.618 else "XIU"
-    preds["quantum"] = random.choice(["TAI", "XIU"])
-    preds["anti_bait"] = opp_item if streak >= 5 or recent_str.endswith("TXTXT") else last_item
-
-    max_s = 1; cur = 1
-    for i in range(1, n):
-        if history[i] == history[i-1]: cur += 1
-        else: max_s = max(max_s, cur); cur = 1
-    preds["smart_breaker"] = opp_item if streak >= max_s - 1 and streak >= 3 else last_item
-
-    l4 = recent_str[-4:]
-    t4, x4 = recent_str[:-1].count(l4 + "T"), recent_str[:-1].count(l4 + "X")
-    preds["ngram_4"] = "TAI" if t4 > x4 else ("XIU" if x4 > t4 else opp_item)
-    l5 = recent_str[-5:]
-    t5, x5 = recent_str[:-1].count(l5 + "T"), recent_str[:-1].count(l5 + "X")
-    preds["ngram_5"] = "TAI" if t5 > x5 else ("XIU" if x5 > t5 else opp_item)
-
-    if recent_str.endswith("TXTXT"): preds["elliott_wave"] = last_item
-    elif recent_str.endswith("TTXXTT"): preds["elliott_wave"] = "XIU"
-    else: preds["elliott_wave"] = opp_item
-
-    if streak in (4, 6): preds["contrarian"] = opp_item
-    elif recent_str[-6:] == "TXTXTX": preds["contrarian"] = "XIU"
-    else: preds["contrarian"] = last_item
-
-    ma10 = recent_str[-10:].count("T") / 10.0
-    preds["bollinger_bands"] = "XIU" if ma10 >= 0.8 else ("TAI" if ma10 <= 0.2 else last_item)
-    t_total = history[-100:].count("TAI")
-    preds["mean_reversion"] = "TAI" if t_total < (len(history[-100:]) * 0.45) else "XIU"
-    preds["mirror_reflection"] = ("TAI" if recent_str[-8] == "T" else "XIU") if len(recent_str) >= 8 else opp_item
-    preds["martingale_trap"] = opp_item if streak in (3, 7) else last_item
-    preds["poisson_prob"] = "TAI" if (history[-5:].count("TAI") % 2 == 1) else "XIU"
-    preds["harmonic_cycle"] = history[-4] if n >= 4 else opp_item
-    preds["breakout_hunter"] = last_item if streak == 1 and history[-2] == history[-3] else opp_item
-    preds["volume_fakeout"] = last_item if recent_str[-5:] in ("TTTXT", "XXXTX") else opp_item
-    preds["time_decay"] = opp_item
-    preds["neural_bias"] = "TAI" if history[-7:].count("TAI") > 3 else "XIU"
-    preds["twin_peaks"] = opp_item if recent_str.endswith(("TTXTT", "XXTXX")) else last_item
-
-    scores = {"TAI": 0.0, "XIU": 0.0}
-    weighted = {}
-    for m, p in preds.items():
-        w = weights[m] * boost.get(m, 1.0)
-        scores[p] += w
-        weighted[m] = w
-
-    total = scores["TAI"] + scores["XIU"]
-    if total == 0:
-        return random.choice(["TAI", "XIU"]), 0, []
-
-    tai_pct = scores["TAI"] / total * 100
-    xiu_pct = scores["XIU"] / total * 100
-    prediction = "TAI" if tai_pct > xiu_pct else "XIU"
-    margin = abs(tai_pct - xiu_pct)
-
-    agree_w = sum(w for m, p in preds.items() if p == prediction for w in [weighted[m]])
-    agree_pct = (agree_w / total) * 100
-
-    confidence = margin * 0.6 + (agree_pct - 50) * 0.8
-    confidence = round(max(0, min(100, confidence)), 1)
-
-    top = sorted([(m, round(weighted[m], 2)) for m in preds if preds[m] == prediction],
-                 key=lambda x: x[1], reverse=True)[:4]
-
-    with state_lock:
-        state["last_predictions"] = preds
-        state["regime"] = regime
-    return prediction, confidence, top
-
-
-def update_global_ai_weights(actual_result, user_id=None):
-    if not (user_id and user_id in user_states and "last_predictions" in user_states[user_id]):
-        return
-    with state_lock:
-        preds = user_states[user_id]["last_predictions"]
-        for model, pred in preds.items():
-            if pred == actual_result:
-                GLOBAL_MODEL_STREAK[model] += 1
-                bonus = 0.3 + 0.15 * min(GLOBAL_MODEL_STREAK[model], 10)
-                GLOBAL_AI_WEIGHTS[model] = min(25.0, GLOBAL_AI_WEIGHTS[model] + bonus)
-            else:
-                GLOBAL_MODEL_STREAK[model] = 0
-                GLOBAL_AI_WEIGHTS[model] = max(0.1, GLOBAL_AI_WEIGHTS[model] * 0.9 - 0.5)
-
-# ==========================================
-# GAME API & SOCKET
-# ==========================================
-def md5_hash(t): return hashlib.md5(t.encode('utf-8')).hexdigest()
-
-def login_and_get_token(username, password):
-    pw_md5 = md5_hash(password)
-    url = f"https://apifo88daigia.tele68.com/api?c=3&un={username}&pw={pw_md5}&cp=R&cl=R&pf=web&at="
-    try:
-        r = requests.get(url, timeout=12); r.raise_for_status(); data = r.json()
-        if not data.get("success"): return {"_error": f"Lỗi Game: {str(data.get('message', 'Sai thông tin'))}"}
-        sk = data["sessionKey"]; sk += "=" * ((4 - len(sk) % 4) % 4)
-        sd = json.loads(base64.b64decode(sk).decode('utf-8'))
-        nickname = sd.get("nickname") or sd.get("nickName")
-        r2 = requests.post("https://wlb.tele68.com/v1/lobby/auth/login?cp=R&cl=R&pf=web&at=",
-                           headers={"authority": "wlb.tele68.com", "content-type": "application/json"},
-                           json={"nickName": nickname, "accessToken": data["accessToken"]}, timeout=12)
-        lobby = r2.json(); token = lobby.get("token")
-        if not token: return {"_error": "Lobby không trả về JWT token."}
-        return {"token": token, "nickname": nickname,
-                "money": lobby.get("remoteLoginResp", {}).get("money", 0)}
-    except Exception as e:
-        return {"_error": f"Lỗi kết nối: {e}"}
-
-def start_websocket(user_id, token, is_background=False):
-    if user_id in active_sockets and not is_background:
-        try: active_sockets[user_id].disconnect()
-        except: pass
-
-    sio = sio_client.Client(reconnection=True, reconnection_attempts=10,
-                            logger=False, engineio_logger=False)
-    if not is_background:
-        active_sockets[user_id] = sio
-        init_user_state(user_id)
-
-    @sio.event(namespace='/txmd5')
-    def connect():
-        if not is_background:
-            send_msg(user_id, "🟢 <b>HỆ THỐNG V5 ONLINE</b>\n<i>35 lõi AI + Regime Detection đã kích hoạt</i>")
-
-    @sio.on('new-session', namespace='/txmd5')
-    def on_new_session(data):
-        if is_background: return
-        with state_lock:
-            state = user_states[user_id]
-            state["session_id"] = data.get('id', 'N/A')
-            state["has_bet_this_session"] = False
-            target_hit = (state["auto_bet_enabled"] and state["target_profit"] is not None
-                          and state["profit_loss"] >= state["target_profit"])
-            if target_hit:
-                state["auto_bet_enabled"] = False
-                pl = state["profit_loss"]
-            history_len = len(GLOBAL_HISTORY)
-
-        if target_hit:
-            send_msg(user_id, f"🏆 <b>ĐẠT TARGET — ĐÃ CHỐT LÃI</b>\n💰 Lãi: <code>{pl:,}</code>\n🔴 Auto tắt an toàn.")
-
-        pred, conf, top = make_prediction_vip(user_id) if history_len >= 10 else (None, 0, [])
-
-        with state_lock:
-            state["current_prediction"] = pred
-            state["current_confidence"] = conf
-            state["current_top_models"] = top
-            if state["x2_mode"] and state["win_streak"] >= 1:
-                state["current_bet"] = state["base_bet_amount"] * 2
-            else:
-                state["current_bet"] = state["base_bet_amount"]
-            sid = state["session_id"]; cur_bet = state["current_bet"]
-            auto = state["auto_bet_enabled"]; min_conf = state["min_confidence"]
-            x2 = state["x2_mode"]; streak_w = state["win_streak"]
-
-        msg = f"🔔 <b>PHIÊN MỚI</b> · <code>#{sid}</code>\n"
-        if pred:
-            pe = "🔵 TÀI" if pred == "TAI" else "🔴 XỈU"
-            stars = "⭐" * min(5, int(conf // 20) + 1)
-            msg += f"🔥 <b>AI CHỐT: {pe}</b> · Độ tin: <b>{conf}%</b> {stars}\n"
-            if top:
-                msg += f"🧠 Top cores: <code>{', '.join(m for m,_ in top[:3])}</code>\n"
-            if auto:
-                if conf >= min_conf:
-                    extra = " ⚡X2" if x2 and streak_w >= 1 else ""
-                    msg += f"⏳ <i>Vào cược{extra}: <code>{cur_bet:,}</code></i>"
-                else:
-                    msg += f"⏸ <i>Bỏ qua (conf {conf}% &lt; {min_conf}%)</i>"
-            else:
-                msg += "⏸ <i>Auto đang tắt</i>"
-        else:
-            msg += f"⏳ <i>Đang thu thập: {history_len}/10...</i>"
-        send_msg(user_id, msg)
-        send_state(user_id)
-
-    @sio.on('tick-update', namespace='/txmd5')
-    def on_tick_update(data):
-        if is_background: return
-        if data.get('state') != 'BETTING': return
-        with state_lock:
-            state = user_states[user_id]
-            can_bet = (state["auto_bet_enabled"] and state["current_prediction"]
-                       and state["current_confidence"] >= state["min_confidence"]
-                       and not state["has_bet_this_session"])
-            if can_bet:
-                state["has_bet_this_session"] = True
-                state["waiting_for_result"] = True
-                pred = state["current_prediction"]; bet = state["current_bet"]
-                conf = state["current_confidence"]
-            else:
-                pred = bet = conf = None
-
-        if can_bet:
-            sio.emit('bet', {"type": pred, "amount": bet}, namespace='/txmd5')
-            send_msg(user_id, f"🚀 <b>VÀO TIỀN:</b> <code>{bet:,}</code> · Conf {conf}%")
-
-    @sio.on('bet-result', namespace='/txmd5')
-    def on_bet_result(data):
-        if is_background: return
-        if "postBalance" in data:
-            with state_lock:
-                user_states[user_id]["balance"] = data["postBalance"]
-        sio.emit('get-current-my-info', None, namespace='/txmd5')
-        send_state(user_id)
-
-    @sio.on('session-result', namespace='/txmd5')
-    def on_session_result(data):
-        result = data.get('resultTruyenThong', 'N/A')
-        if result not in ("TAI", "XIU"):
-            if not is_background: send_state(user_id)
-            return
-
-        GLOBAL_HISTORY.append(result)
-        if len(GLOBAL_HISTORY) > MAX_GLOBAL_HISTORY: GLOBAL_HISTORY.pop(0)
-        update_global_ai_weights(result, None if is_background else user_id)
-        if is_background: return
-
-        with state_lock:
-            state = user_states[user_id]
-            state["history_tail"].append(result)
-            if len(state["history_tail"]) > 200: state["history_tail"].pop(0)
-
-            dices = data.get('dices', [0, 0, 0])
-            re = "🔵 TÀI" if result == "TAI" else "🔴 XỈU"
-
-            if state["current_prediction"]:
-                state["pred_total"] += 1
-                if state["current_prediction"] == result:
-                    state["pred_correct"] += 1
-
-            msg = f"🎲 <b>KẾT QUẢ: {re}</b> ({dices[0]}-{dices[1]}-{dices[2]})\n"
-
-            if state["current_prediction"] and state["waiting_for_result"]:
-                if state["current_prediction"] == result:
-                    win = int(state["current_bet"] * 0.98)
-                    state["profit_loss"] += win
-                    state["win_streak"] += 1
-                    msg += f"✅ <b>HÚP!</b> Lãi: <code>+{win:,}</code>\n"
-                else:
-                    state["profit_loss"] -= state["current_bet"]
-                    state["win_streak"] = 0
-                    msg += f"❌ <b>GÃY CẦU</b>\n"
-                state["waiting_for_result"] = False
-
-            acc = (state["pred_correct"] / state["pred_total"] * 100) if state["pred_total"] > 0 else 0
-            msg += (f"📊 Lãi/Lỗ: <b>{state['profit_loss']:,}</b> · "
-                    f"💳 Dư: <b>{state['balance']:,}</b>\n"
-                    f"🎯 Accuracy: <b>{acc:.1f}%</b> ({state['pred_correct']}/{state['pred_total']})")
-
-        send_msg(user_id, msg)
-        send_state(user_id)
-
-    try:
-        sio.connect('https://wtxmd52.tele68.com', socketio_path='txmd5/',
-                    namespaces=['/txmd5'], transports=['websocket'],
-                    auth={"token": token}, headers={"User-Agent": "Mozilla/5.0"})
-        sio.wait()
-    except Exception as e:
-        if not is_background: send_msg(user_id, f"⚠️ Lỗi kết nối: <code>{e}</code>")
-
-def background_data_collector():
-    if DATA_COLLECTOR_USER != "acc_clone_soi_cau":
-        logger.info("Khởi động AI soi cầu ngầm...")
-        while True:
-            try:
-                res = login_and_get_token(DATA_COLLECTOR_USER, DATA_COLLECTOR_PASS)
-                if "token" in res:
-                    logger.info("Đã kết nối. Train 35 lõi AI...")
-                    start_websocket("BG", res["token"], is_background=True)
-            except Exception: pass
-            time.sleep(30)
-
-# ==========================================
-# AUTH DECORATORS
-# ==========================================
-def require_login(f):
-    @wraps(f)
-    def w(*a, **kw):
-        if 'user' not in session: return jsonify({"error": "Chưa đăng nhập"}), 401
-        return f(*a, **kw)
-    return w
-
-def require_vip(f):
-    @wraps(f)
-    def w(*a, **kw):
-        u = session.get('user')
-        if not u: return jsonify({"error": "Chưa đăng nhập"}), 401
-        if not USERS.get(u, {}).get('is_vip'): return jsonify({"error": "Không có VIP"}), 403
-        return f(*a, **kw)
-    return w
-
-# ==========================================
-# HTML TEMPLATES
-# ==========================================
-LOGIN_HTML = """<!DOCTYPE html>
-<html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Tài Xỉu V5 — Đăng nhập</title>
+# Giao diện HTML giữ nguyên toàn bộ, đã trỏ endpoint login về backend Python
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="format-detection" content="telephone=no" />
+<title>AUTO CƯỢC LC79 — HuyDaiXuVN</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"></script>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-  background:radial-gradient(circle at 20% 20%,#1e3a8a,#0f172a 60%);
-  min-height:100vh;display:flex;align-items:center;justify-content:center;color:#e2e8f0;overflow:hidden}
-body:before{content:'';position:fixed;width:500px;height:500px;background:radial-gradient(circle,#0ea5e9 0%,transparent 70%);
-  filter:blur(80px);opacity:.3;top:-100px;right:-100px;animation:float 20s infinite}
-body:after{content:'';position:fixed;width:400px;height:400px;background:radial-gradient(circle,#6366f1 0%,transparent 70%);
-  filter:blur(80px);opacity:.25;bottom:-100px;left:-100px;animation:float 25s infinite reverse}
-@keyframes float{50%{transform:translate(80px,40px)}}
-.card{position:relative;z-index:1;width:380px;max-width:92vw;padding:40px 32px;
-  background:rgba(30,41,59,.75);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
-  border-radius:20px;border:1px solid rgba(148,163,184,.15);
-  box-shadow:0 20px 60px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.05)}
-.logo{text-align:center;font-size:44px;margin-bottom:8px;filter:drop-shadow(0 0 20px #0ea5e9)}
-h1{text-align:center;font-size:19px;color:#38bdf8;margin-bottom:6px;font-weight:700}
-.sub{text-align:center;font-size:11px;color:#64748b;margin-bottom:28px;letter-spacing:1px;text-transform:uppercase}
-.field{margin-bottom:14px}
-label{display:block;font-size:11px;color:#94a3b8;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}
-input{width:100%;padding:13px 16px;border-radius:10px;border:1px solid rgba(148,163,184,.2);
-  background:rgba(15,23,42,.7);color:#e2e8f0;font-size:14px;outline:none;transition:.2s}
-input:focus{border-color:#0ea5e9;box-shadow:0 0 0 3px rgba(14,165,233,.15)}
-button{width:100%;padding:14px;border:none;border-radius:10px;font-weight:700;font-size:15px;
-  background:linear-gradient(135deg,#0ea5e9,#6366f1);color:#fff;cursor:pointer;
-  transition:.2s;letter-spacing:.5px;box-shadow:0 8px 24px rgba(14,165,233,.35)}
-button:hover{transform:translateY(-2px);box-shadow:0 12px 32px rgba(14,165,233,.45)}
-button:active{transform:translateY(0)}
-.err{color:#f87171;text-align:center;margin-top:12px;font-size:13px;min-height:20px}
-.hint{text-align:center;font-size:11px;color:#64748b;margin-top:20px}
-</style></head>
-<body>
-<div class="card">
-  <div class="logo">🤖</div>
-  <h1>AI TÀI XỈU ULTRA V5</h1>
-  <div class="sub">35 Cores · Regime Detection · Live</div>
-  <div class="field"><label>Tên đăng nhập</label>
-    <input id="username" autocomplete="username" placeholder="admin"></div>
-  <div class="field"><label>Mật khẩu</label>
-    <input id="password" type="password" autocomplete="current-password" placeholder="••••••"></div>
-  <button onclick="doLogin()">ĐĂNG NHẬP</button>
-  <div class="err" id="err"></div>
-  <div class="hint">Mặc định: admin / admin123</div>
-</div>
-<script>
-async function doLogin() {
-  const username = document.getElementById('username').value.trim();
-  const password = document.getElementById('password').value;
-  const err = document.getElementById('err'); err.textContent = '';
-  try {
-    const r = await fetch('/api/login', {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify({username,password})});
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.error || 'Lỗi');
-    window.location.href = '/';
-  } catch (e) { err.textContent = '❌ ' + e.message; }
-}
-document.getElementById('password').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
-</script>
-</body></html>"""
+  /* ================= RESET & CHỐNG ZOOM ================= */
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    touch-action: manipulation;
+    -webkit-text-size-adjust: 100%;
+    -ms-text-size-adjust: 100%;
+    overscroll-behavior: none;
+    height: 100%;
+  }
+  :root {
+    --primary: #e63946;
+    --primary-2: #ff4d6d;
+    --primary-dark: #b5172a;
+    --accent: #ffb703;
+    --gold: #f4b400;
+    --ink: #0d1117;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --bg: #f6f7fb;
+    --success: #10b981;
+    --danger: #ef4444;
+    --shadow-md: 0 8px 24px rgba(15, 23, 42, 0.06);
+    --shadow-lg: 0 20px 60px rgba(15, 23, 42, 0.08);
+  }
+  body {
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg);
+    color: #1f2937;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  input, textarea { user-select: text; -webkit-user-select: text; }
 
-INDEX_HTML = """<!DOCTYPE html>
-<html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Tài Xỉu V5</title>
-<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<style>
-:root{
-  --bg:#0a0f1e;--panel:#111827;--panel2:#1a2332;--border:#1f2937;
-  --text:#e2e8f0;--muted:#64748b;--accent:#0ea5e9;--accent2:#6366f1;
-  --green:#22c55e;--red:#ef4444;--gold:#f59e0b;--tai:#0ea5e9;--xiu:#ef4444;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-  background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
-body::before{content:'';position:fixed;top:-30%;left:-10%;width:600px;height:600px;
-  background:radial-gradient(circle,rgba(14,165,233,.15),transparent 70%);
-  filter:blur(80px);pointer-events:none;z-index:0}
-body::after{content:'';position:fixed;bottom:-30%;right:-10%;width:500px;height:500px;
-  background:radial-gradient(circle,rgba(99,102,241,.12),transparent 70%);
-  filter:blur(80px);pointer-events:none;z-index:0}
+  /* ================= HEADER ================= */
+  .header {
+    background: rgba(255, 255, 255, 0.9);
+    backdrop-filter: saturate(180%) blur(14px);
+    -webkit-backdrop-filter: saturate(180%) blur(14px);
+    border-bottom: 1px solid rgba(15, 23, 42, 0.06);
+    position: sticky; top: 0; z-index: 100;
+  }
+  .header-inner {
+    max-width: 1280px; margin: 0 auto;
+    padding: 12px 20px;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--ink); }
+  .brand-mark {
+    width: 40px; height: 40px; border-radius: 11px;
+    background: radial-gradient(circle at 30% 30%, #ff9a9e 0%, transparent 55%),
+                linear-gradient(135deg, var(--primary-2), var(--primary-dark));
+    display: grid; place-items: center;
+    color: #fff; font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700; font-size: 12px;
+    box-shadow: 0 6px 16px rgba(230, 57, 70, 0.35);
+  }
+  .brand-name { display: flex; flex-direction: column; line-height: 1.15; }
+  .brand-name strong {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 14px; font-weight: 700;
+    color: var(--ink); letter-spacing: 0.3px;
+  }
+  .brand-name small {
+    font-size: 10px; letter-spacing: 1.8px;
+    color: var(--muted); text-transform: uppercase; font-weight: 600;
+  }
+  .header-right { display: flex; align-items: center; gap: 10px; }
+  .user-chip {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 12px 5px 5px;
+    background: #fff; border: 1px solid var(--line);
+    border-radius: 999px;
+    font-size: 13px; font-weight: 600; color: var(--ink);
+    max-width: 200px;
+  }
+  .user-chip .avatar {
+    width: 28px; height: 28px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--primary-2), var(--primary-dark));
+    color: #fff; display: grid; place-items: center;
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    flex-shrink: 0;
+  }
+  .user-chip span {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .btn-logout {
+    padding: 8px 14px;
+    background: #fef2f2; color: var(--primary);
+    border: 1px solid #fecaca; border-radius: 9px;
+    font-family: inherit; font-size: 13px; font-weight: 600;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+    transition: all 0.2s;
+  }
+  .btn-logout:hover { background: #fee2e2; border-color: #fca5a5; }
 
-.topbar{position:sticky;top:0;z-index:10;display:flex;justify-content:space-between;
-  align-items:center;padding:14px 24px;background:rgba(17,24,39,.85);backdrop-filter:blur(20px);
-  border-bottom:1px solid var(--border)}
-.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:15px;color:#fff}
-.brand-logo{font-size:22px;filter:drop-shadow(0 0 8px var(--accent))}
-.brand-sub{font-size:10px;color:var(--muted);font-weight:400;letter-spacing:1px;text-transform:uppercase}
-.top-right{display:flex;align-items:center;gap:12px;font-size:13px}
-.badge{padding:4px 10px;border-radius:6px;font-size:10px;font-weight:800;letter-spacing:.5px}
-.badge.vip{background:linear-gradient(135deg,#0ea5e9,#0284c7);color:#fff}
-.badge.admin{background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff}
-.btn-logout{background:rgba(239,68,68,.15);color:#fca5a5;border:1px solid rgba(239,68,68,.3);
-  padding:7px 14px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600;transition:.2s}
-.btn-logout:hover{background:rgba(239,68,68,.25)}
+  /* ================= LOGIN VIEW ================= */
+  .main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    max-width: 1180px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 24px 20px;
+    gap: 32px;
+    align-items: center;
+  }
+  .brand-panel {
+    position: relative;
+    min-height: 520px;
+    border-radius: 22px;
+    padding: 40px 36px;
+    color: #fff;
+    background:
+      radial-gradient(circle at 20% 10%, rgba(255, 183, 3, 0.18) 0%, transparent 40%),
+      radial-gradient(circle at 90% 90%, rgba(255, 77, 109, 0.25) 0%, transparent 45%),
+      linear-gradient(150deg, #1a1f2e 0%, #0d1117 60%, #1a0a10 100%);
+    overflow: hidden;
+    display: flex; flex-direction: column; justify-content: space-between;
+    box-shadow: var(--shadow-lg);
+    isolation: isolate;
+  }
+  .brand-panel::before {
+    content: ''; position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px);
+    background-size: 40px 40px;
+    mask-image: radial-gradient(ellipse at 50% 0%, #000 30%, transparent 75%);
+    -webkit-mask-image: radial-gradient(ellipse at 50% 0%, #000 30%, transparent 75%);
+  }
+  .brand-panel > * { position: relative; z-index: 1; }
+  .badge-new {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 5px 11px 5px 7px; border-radius: 999px;
+    font-size: 11px; font-weight: 600;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    width: fit-content;
+  }
+  .badge-new .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.25);
+  }
+  .brand-panel h1 {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: clamp(24px, 3vw, 36px);
+    line-height: 1.18; font-weight: 700;
+    letter-spacing: -0.7px;
+    margin: 18px 0 12px; max-width: 440px;
+  }
+  .brand-panel h1 .grad {
+    background: linear-gradient(120deg, #ff4d6d 0%, #ffb703 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  }
+  .brand-panel p.lead {
+    font-size: 14.5px; line-height: 1.7;
+    color: rgba(255, 255, 255, 0.65); max-width: 400px;
+  }
+  .feature-list { display: grid; gap: 10px; margin-top: 24px; }
+  .feature-item {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 14px; border-radius: 11px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .feature-icon {
+    width: 32px; height: 32px; border-radius: 9px;
+    background: linear-gradient(135deg, rgba(255, 77, 109, 0.25), rgba(255, 183, 3, 0.2));
+    display: grid; place-items: center; flex-shrink: 0; color: #ffb703;
+  }
+  .feature-item strong {
+    display: block; font-size: 13px; font-weight: 600;
+    color: #fff; margin-bottom: 1px;
+  }
+  .feature-item small { font-size: 11.5px; color: rgba(255, 255, 255, 0.5); }
 
-.layout{position:relative;z-index:1;display:grid;grid-template-columns:420px 1fr 380px;
-  gap:16px;padding:16px;min-height:calc(100vh - 60px);max-width:1800px;margin:0 auto}
-@media(max-width:1400px){.layout{grid-template-columns:400px 1fr}}
-@media(max-width:1024px){.layout{grid-template-columns:1fr;padding:12px}}
+  .login-panel { display: flex; justify-content: center; align-items: center; }
+  .login-card {
+    width: 100%; max-width: 420px;
+    background: #fff; border-radius: 18px;
+    padding: 36px 30px 32px;
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow-md);
+  }
+  .login-card h2 {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 22px; font-weight: 700;
+    letter-spacing: -0.4px; color: var(--ink);
+    margin-bottom: 5px;
+  }
+  .login-card .subtitle {
+    font-size: 13.5px; color: var(--muted); margin-bottom: 24px;
+  }
+  .alert {
+    display: none; align-items: flex-start; gap: 9px;
+    padding: 11px 13px; border-radius: 10px;
+    font-size: 13px; line-height: 1.5; margin-bottom: 16px;
+  }
+  .alert.show { display: flex; }
+  .alert.error {
+    background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c;
+  }
+  .alert.error svg { color: var(--danger); flex-shrink: 0; margin-top: 1px; }
 
-.panel{background:rgba(17,24,39,.7);backdrop-filter:blur(20px);
-  border:1px solid var(--border);border-radius:16px;padding:18px;overflow:hidden;
-  display:flex;flex-direction:column}
-.panel-title{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);
-  margin-bottom:14px;font-weight:700;display:flex;align-items:center;gap:8px}
+  .field { margin-bottom: 16px; }
+  .field label {
+    display: block; font-size: 12.5px; font-weight: 600;
+    color: #374151; margin-bottom: 6px;
+  }
+  .input-box { position: relative; }
+  .input-box .lead {
+    position: absolute; left: 13px; top: 50%;
+    transform: translateY(-50%);
+    width: 17px; height: 17px;
+    color: #9ca3af; pointer-events: none;
+    transition: color 0.2s;
+  }
+  .input-box input {
+    width: 100%;
+    padding: 12px 42px 12px 40px;
+    font-size: 14px; font-family: inherit;
+    color: var(--ink); background: #fff;
+    border: 1.5px solid #e5e7eb;
+    border-radius: 10px; outline: none;
+    transition: all 0.2s; font-weight: 500;
+  }
+  .input-box input::placeholder { color: #9ca3af; font-weight: 400; }
+  .input-box input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 4px rgba(230, 57, 70, 0.1);
+  }
+  .input-box input:focus ~ .lead { color: var(--primary); }
+  .btn-eye {
+    position: absolute; right: 6px; top: 50%;
+    transform: translateY(-50%);
+    width: 30px; height: 30px; border-radius: 7px;
+    border: none; background: transparent;
+    color: #9ca3af; cursor: pointer;
+    display: grid; place-items: center;
+    transition: all 0.15s;
+  }
+  .btn-eye:hover { color: var(--primary); background: #fef2f2; }
 
-.hero{position:relative;background:linear-gradient(135deg,rgba(14,165,233,.1),rgba(99,102,241,.1));
-  border:1px solid rgba(14,165,233,.25);border-radius:16px;padding:24px;text-align:center;
-  margin-bottom:16px;overflow:hidden;transition:.4s}
-.hero.tai{border-color:rgba(14,165,233,.4);box-shadow:0 0 40px rgba(14,165,233,.15)}
-.hero.xiu{border-color:rgba(239,68,68,.4);box-shadow:0 0 40px rgba(239,68,68,.15)}
-.hero.none{border-color:rgba(100,116,139,.25)}
-.hero::before{content:'';position:absolute;inset:0;
-  background:linear-gradient(45deg,transparent 30%,rgba(255,255,255,.03) 50%,transparent 70%);
-  animation:shimmer 3s infinite;pointer-events:none}
-@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
-.hero-label{font-size:10px;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin-bottom:12px}
-.hero-pred{font-size:48px;font-weight:900;letter-spacing:2px;margin-bottom:8px;
-  filter:drop-shadow(0 0 20px currentColor);transition:.3s}
-.hero-pred.tai{color:var(--tai)}.hero-pred.xiu{color:var(--xiu)}
-.hero-pred.none{color:var(--muted);font-size:32px}
-.hero-conf{font-size:13px;color:var(--muted)}
-.hero-conf b{color:#fff;font-size:16px}
-.hero-cores{margin-top:14px;font-size:11px;color:var(--muted);line-height:1.6}
-.hero-cores code{background:rgba(14,165,233,.15);color:#7dd3fc;padding:2px 8px;
-  border-radius:4px;margin:0 3px;font-family:monospace}
-.hero-regime{margin-top:8px;font-size:11px;color:var(--muted)}
-.hero-regime b{color:#f59e0b;text-transform:uppercase;letter-spacing:1px}
+  .remember {
+    display: inline-flex; align-items: center; gap: 8px;
+    cursor: pointer; font-size: 13px; color: #4b5563;
+    margin-bottom: 20px; user-select: none;
+  }
+  .remember input { position: absolute; opacity: 0; pointer-events: none; }
+  .remember .box {
+    width: 17px; height: 17px; border-radius: 4px;
+    border: 1.5px solid #d1d5db;
+    display: grid; place-items: center;
+    transition: all 0.2s; background: #fff;
+  }
+  .remember .box svg {
+    width: 10px; height: 10px; color: #fff;
+    opacity: 0; transform: scale(0.6); transition: all 0.2s;
+  }
+  .remember input:checked + .box {
+    background: var(--primary); border-color: var(--primary);
+  }
+  .remember input:checked + .box svg { opacity: 1; transform: scale(1); }
 
-.gauge-wrap{position:relative;width:140px;height:140px;margin:0 auto 16px}
-.gauge-svg{transform:rotate(-90deg);width:100%;height:100%}
-.gauge-track{fill:none;stroke:rgba(100,116,139,.2);stroke-width:10}
-.gauge-fill{fill:none;stroke:url(#ggrad);stroke-width:10;stroke-linecap:round;
-  transition:stroke-dasharray .8s cubic-bezier(.4,0,.2,1)}
-.gauge-value{position:absolute;inset:0;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;font-weight:900}
-.gauge-value .n{font-size:32px;background:linear-gradient(135deg,#0ea5e9,#6366f1);
-  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.gauge-value .u{font-size:10px;color:var(--muted);letter-spacing:1px;text-transform:uppercase}
+  .btn-submit {
+    width: 100%; padding: 13px;
+    font-size: 14.5px; font-weight: 600; font-family: inherit;
+    color: #fff;
+    background: linear-gradient(135deg, var(--primary-2), var(--primary-dark));
+    border: none; border-radius: 10px;
+    cursor: pointer; transition: all 0.25s;
+    box-shadow: 0 5px 16px rgba(230, 57, 70, 0.32);
+    display: flex; align-items: center; justify-content: center;
+    gap: 8px;
+  }
+  .btn-submit:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 8px 22px rgba(230, 57, 70, 0.42);
+  }
+  .btn-submit:disabled { cursor: not-allowed; opacity: 0.9; }
+  .spinner {
+    width: 15px; height: 15px;
+    border: 2px solid rgba(255,255,255,0.35);
+    border-top-color: #fff; border-radius: 50%;
+    animation: spin 0.7s linear infinite; display: none;
+  }
+  .btn-submit.loading .spinner { display: block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
-.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
-.stat{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:12px;text-align:center}
-.stat .k{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
-.stat .v{font-size:16px;font-weight:800;color:#7dd3fc;word-break:break-all}
-.stat.pos .v{color:var(--green)}.stat.neg .v{color:var(--red)}
+  /* ================= DASHBOARD ================= */
+  .dash {
+    flex: 1; max-width: 1000px;
+    width: 100%; margin: 0 auto;
+    padding: 20px;
+    display: flex; flex-direction: column;
+    gap: 16px;
+  }
+  .welcome-card {
+    background: linear-gradient(135deg, var(--primary-2), var(--primary-dark));
+    color: #fff; padding: 24px 26px;
+    border-radius: 18px;
+    display: flex; align-items: center; gap: 16px;
+    box-shadow: 0 10px 26px rgba(230, 57, 70, 0.28);
+    position: relative; overflow: hidden;
+  }
+  .welcome-card::after {
+    content: ''; position: absolute;
+    width: 220px; height: 220px; border-radius: 50%;
+    background: rgba(255, 255, 255, 0.15);
+    top: -90px; right: -70px;
+  }
+  .welcome-avatar {
+    width: 62px; height: 62px; border-radius: 16px;
+    background: rgba(255, 255, 255, 0.22);
+    display: grid; place-items: center;
+    font-size: 24px; font-weight: 800;
+    font-family: 'Space Grotesk', sans-serif;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    flex-shrink: 0; position: relative; z-index: 1;
+    text-transform: uppercase;
+  }
+  .welcome-info { position: relative; z-index: 1; min-width: 0; }
+  .welcome-info .greet {
+    font-size: 12px; opacity: 0.85; margin-bottom: 1px; font-weight: 500;
+  }
+  .welcome-info h2 {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 20px; font-weight: 700; margin-bottom: 4px;
+    letter-spacing: -0.3px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: 100%;
+  }
+  .level-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 10px;
+    background: linear-gradient(135deg, #ffb703, #ff8c00);
+    border-radius: 999px;
+    font-size: 11px; font-weight: 700;
+    color: #1a1f2e;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
 
-.chart-wrap{background:var(--panel2);border:1px solid var(--border);border-radius:12px;
-  padding:12px;height:180px;position:relative}
-.chart-wrap canvas{max-height:100%}
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+  }
+  .stat-card {
+    background: #fff; border-radius: 16px;
+    padding: 18px 18px 16px;
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow-md);
+    border-left: 4px solid var(--primary);
+    position: relative;
+  }
+  .stat-card.vin { border-left-color: var(--primary); }
+  .stat-card.xu { border-left-color: var(--gold); }
+  .stat-card.vip { border-left-color: var(--accent); }
+  .stat-label {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; color: var(--muted);
+    font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 10px;
+  }
+  .stat-label svg { width: 13px; height: 13px; }
+  .stat-card.vin .stat-label svg { color: var(--primary); }
+  .stat-card.xu .stat-label svg { color: var(--gold); }
+  .stat-card.vip .stat-label svg { color: var(--accent); }
+  .stat-value {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: clamp(22px, 2.8vw, 30px);
+    font-weight: 700; color: var(--ink);
+    letter-spacing: -0.5px;
+    display: flex; align-items: center; gap: 8px;
+    word-break: break-all;
+  }
+  .stat-unit {
+    font-size: 12px; font-weight: 600;
+    color: var(--muted); margin-left: 4px;
+  }
+  .stat-value .hide-toggle {
+    background: none; border: none;
+    color: var(--muted); cursor: pointer;
+    padding: 3px; display: grid; place-items: center;
+    border-radius: 5px; transition: all 0.15s;
+  }
+  .stat-value .hide-toggle:hover { color: var(--primary); background: #fef2f2; }
+  .stat-hint {
+    margin-top: 6px; font-size: 11.5px; color: var(--muted);
+  }
 
-.chat{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;
-  padding-right:4px;scrollbar-width:thin;scrollbar-color:var(--border) transparent;
-  max-height:calc(100vh - 380px)}
-.chat::-webkit-scrollbar{width:6px}
-.chat::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-.msg{background:rgba(15,23,42,.6);border-left:3px solid var(--accent);
-  padding:10px 14px;border-radius:8px;font-size:12.5px;line-height:1.6;
-  animation:slideIn .3s ease;word-wrap:break-word}
-@keyframes slideIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
-.msg code{background:rgba(14,165,233,.15);color:#7dd3fc;padding:1px 6px;
-  border-radius:3px;font-family:'SF Mono',Monaco,monospace;font-size:11.5px}
-.msg b{color:#fff;font-weight:700}
-.msg.win{border-left-color:var(--green);background:rgba(34,197,94,.08)}
-.msg.loss{border-left-color:var(--red);background:rgba(239,68,68,.08)}
+  .info-card {
+    background: #fff; border-radius: 16px;
+    padding: 20px 22px;
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow-md);
+  }
+  .info-card h3 {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 15px; font-weight: 700;
+    color: var(--ink); margin-bottom: 14px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .info-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 10px;
+  }
+  .info-item {
+    padding: 10px 12px;
+    background: #f8f9fb;
+    border-radius: 9px;
+    border: 1px solid #eef0f4;
+  }
+  .info-key {
+    font-size: 10.5px; color: var(--muted);
+    font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.4px; margin-bottom: 3px;
+  }
+  .info-value {
+    font-size: 13px; color: var(--ink);
+    font-weight: 600; word-break: break-all;
+  }
+  .info-value.mono {
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 12px;
+  }
+  .info-value.ok { color: var(--success); }
+  .info-value.warn { color: var(--danger); }
+  .info-value.muted { color: var(--muted); font-style: italic; font-weight: 500; }
 
-.tabs{display:flex;gap:4px;margin-bottom:16px;background:var(--panel2);
-  padding:4px;border-radius:10px}
-.tab{flex:1;padding:9px;background:transparent;border:none;border-radius:7px;
-  cursor:pointer;font-size:11px;font-weight:700;color:var(--muted);
-  text-transform:uppercase;letter-spacing:.5px;transition:.2s}
-.tab:hover{color:var(--text)}
-.tab.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;
-  box-shadow:0 4px 12px rgba(14,165,233,.3)}
-.tab-content{display:none;flex:1;overflow-y:auto;padding-right:4px;
-  scrollbar-width:thin;scrollbar-color:var(--border) transparent}
-.tab-content::-webkit-scrollbar{width:6px}
-.tab-content::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-.tab-content.active{display:block}
+  .reveal-btn {
+    background: none; border: 1px solid var(--line);
+    padding: 3px 8px; border-radius: 6px;
+    font-size: 11px; font-weight: 600;
+    color: var(--muted); cursor: pointer;
+    font-family: inherit; margin-left: 6px;
+    transition: all 0.15s;
+  }
+  .reveal-btn:hover { color: var(--primary); border-color: var(--primary); }
 
-.field{margin-bottom:12px}
-.field label{display:block;font-size:10px;color:var(--muted);margin-bottom:6px;
-  text-transform:uppercase;letter-spacing:.5px;font-weight:600}
-.field input{width:100%;padding:10px 12px;background:var(--panel2);
-  border:1px solid var(--border);border-radius:8px;color:var(--text);
-  font-size:13px;outline:none;transition:.2s}
-.field input:focus{border-color:var(--accent);
-  box-shadow:0 0 0 3px rgba(14,165,233,.12)}
-.btn{width:100%;padding:11px;border:none;border-radius:9px;font-weight:700;
-  cursor:pointer;font-size:12.5px;color:#fff;background:linear-gradient(135deg,var(--accent),var(--accent2));
-  transition:.2s;letter-spacing:.5px;margin-bottom:8px}
-.btn:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(14,165,233,.35)}
-.btn:active{transform:translateY(0)}
-.btn.green{background:linear-gradient(135deg,#22c55e,#16a34a)}
-.btn.green:hover{box-shadow:0 6px 16px rgba(34,197,94,.35)}
-.btn.red{background:linear-gradient(135deg,#ef4444,#dc2626)}
-.btn.red:hover{box-shadow:0 6px 16px rgba(239,68,68,.35)}
-.btn.gray{background:#374151}
-.btn.small{padding:7px;font-size:11px}
-.row{display:flex;gap:8px}.row .btn{margin-bottom:0}
+  details.raw-data {
+    background: #1a1f2e;
+    border-radius: 12px;
+    padding: 14px 18px;
+    color: #a8b3d0;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  details.raw-data summary {
+    cursor: pointer; font-weight: 600; color: #fff;
+    font-size: 13px; list-style: none;
+    display: flex; align-items: center; gap: 8px;
+    user-select: none;
+  }
+  details.raw-data summary::-webkit-details-marker { display: none; }
+  details.raw-data summary::before {
+    content: '▸'; display: inline-block;
+    transition: transform 0.2s; color: #ffb703;
+  }
+  details.raw-data[open] summary::before { transform: rotate(90deg); }
+  details.raw-data pre {
+    margin-top: 12px;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 11.5px; white-space: pre-wrap;
+    word-break: break-word; color: #e2e8f0;
+    max-height: 380px; overflow-y: auto;
+  }
 
-.weight-row{display:flex;justify-content:space-between;align-items:center;
-  padding:8px 10px;background:var(--panel2);border-radius:6px;margin-bottom:4px;font-size:12px}
-.weight-row .name{color:#cbd5e1;font-family:monospace;min-width:130px}
-.weight-row .bar{flex:1;height:4px;background:rgba(100,116,139,.2);border-radius:2px;
-  margin:0 12px;overflow:hidden}
-.weight-row .bar>div{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));
-  border-radius:2px;transition:width .5s}
-.weight-row .val{color:#7dd3fc;font-family:monospace;font-weight:700;min-width:44px;text-align:right}
+  /* ================= FOOTER ================= */
+  .footer {
+    background: #fff; border-top: 1px solid var(--line);
+    padding: 18px 20px; margin-top: auto;
+  }
+  .footer-inner {
+    max-width: 1280px; margin: 0 auto;
+    display: flex; flex-wrap: wrap;
+    align-items: center; justify-content: space-between;
+    gap: 12px;
+  }
+  .copyright {
+    font-size: 12.5px; color: var(--muted);
+    display: flex; align-items: center; gap: 5px;
+    flex-wrap: wrap;
+  }
+  .copyright b {
+    background: linear-gradient(135deg, var(--primary-2), var(--primary-dark));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text; font-weight: 700;
+  }
 
-.user-row{display:flex;justify-content:space-between;align-items:center;
-  padding:8px 12px;background:var(--panel2);border-radius:8px;margin-bottom:6px;font-size:12px}
-.user-row .info{display:flex;align-items:center;gap:8px}
-.user-row .actions{display:flex;gap:4px}
-.user-row button{padding:5px 10px;font-size:10px;border:none;border-radius:5px;
-  cursor:pointer;color:#fff;font-weight:700}
-
-.toast-box{position:fixed;top:80px;right:20px;z-index:1000;display:flex;
-  flex-direction:column;gap:8px;pointer-events:none}
-.toast{background:rgba(30,41,59,.95);backdrop-filter:blur(20px);border:1px solid var(--border);
-  padding:12px 18px;border-radius:10px;font-size:13px;color:#fff;
-  box-shadow:0 10px 30px rgba(0,0,0,.4);animation:toastIn .3s ease;max-width:320px;pointer-events:auto}
-.toast.success{border-left:3px solid var(--green)}
-.toast.error{border-left:3px solid var(--red)}
-.toast.info{border-left:3px solid var(--accent)}
-@keyframes toastIn{from{opacity:0;transform:translateX(60px)}to{opacity:1;transform:none}}
-@keyframes toastOut{to{opacity:0;transform:translateX(60px)}}
-
-.history-strip{display:flex;gap:3px;flex-wrap:wrap;padding:8px 0}
-.history-chip{width:26px;height:26px;border-radius:6px;display:flex;
-  align-items:center;justify-content:center;font-size:10px;font-weight:900;color:#fff}
-.history-chip.tai{background:linear-gradient(135deg,#0ea5e9,#0284c7)}
-.history-chip.xiu{background:linear-gradient(135deg,#ef4444,#b91c1c)}
-
-.live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;
-  background:var(--green);margin-right:6px;animation:pulse 1.5s infinite}
-@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(34,197,94,.7)}
-  50%{opacity:.6;box-shadow:0 0 0 6px rgba(34,197,94,0)}}
-.live-dot.off{background:var(--red);animation:none}
+  /* ================= RESPONSIVE ================= */
+  @media (max-width: 900px) {
+    .main {
+      grid-template-columns: 1fr;
+      padding: 18px 16px; gap: 20px;
+    }
+    .brand-panel {
+      min-height: auto;
+      padding: 28px 24px;
+      border-radius: 16px;
+    }
+    .feature-list { display: none; }
+    .brand-panel h1 { font-size: 22px; margin: 14px 0 10px; }
+    .brand-panel p.lead { font-size: 13.5px; }
+  }
+  @media (max-width: 720px) {
+    .stats-grid { grid-template-columns: 1fr; }
+    .welcome-card { padding: 20px; gap: 14px; }
+    .welcome-avatar { width: 52px; height: 52px; font-size: 20px; }
+    .welcome-info h2 { font-size: 17px; }
+    .login-card { padding: 30px 22px 26px; }
+    .login-card h2 { font-size: 20px; }
+  }
+  @media (max-width: 480px) {
+    .header-inner { padding: 10px 14px; }
+    .user-chip span { display: none; }
+    .user-chip { padding: 4px; }
+    .brand-name small { font-size: 9px; letter-spacing: 1.4px; }
+    .dash { padding: 14px; gap: 12px; }
+    .stat-card { padding: 14px 16px; }
+    .stat-value { font-size: 22px; }
+  }
 </style>
 </head>
 <body>
 
-<div class="topbar">
-  <div class="brand">
-    <span class="brand-logo">🤖</span>
-    <div>
-      <div>AI TÀI XỈU ULTRA V5</div>
-      <div class="brand-sub">35 Cores · Regime · Live Streaming</div>
+<!-- ================== LOGIN VIEW ================== -->
+<div id="loginView">
+  <header class="header">
+    <div class="header-inner">
+      <a href="#" class="brand">
+        <div class="brand-mark">LC79</div>
+        <div class="brand-name">
+          <strong>AUTO CƯỢC LC79</strong>
+          <small>Automation System</small>
+        </div>
+      </a>
     </div>
-  </div>
-  <div class="top-right">
-    <span id="live-indicator"><span class="live-dot off"></span><span id="live-text">Offline</span></span>
-    <span>👤 <b id="u-name">...</b></span>
-    <span class="badge vip" id="u-vip" style="display:none">VIP</span>
-    <span class="badge admin" id="u-admin" style="display:none">ADMIN</span>
-    <button class="btn-logout" onclick="logout()">Thoát</button>
-  </div>
+  </header>
+
+  <main class="main">
+    <section class="brand-panel">
+      <div>
+        <div class="badge-new"><span class="dot"></span>Hệ thống đang hoạt động ổn định</div>
+        <h1>Đăng nhập để bước vào<br><span class="grad">kỷ nguyên tự động hóa</span></h1>
+        <p class="lead">
+          Nền tảng quản lý tài khoản và tự động hóa chuyên nghiệp — kiểm soát số dư, VIP và toàn bộ thông tin tài khoản chỉ trong một giao diện.
+        </p>
+        <div class="feature-list">
+          <div class="feature-item">
+            <div class="feature-icon">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            </div>
+            <div><strong>Bảo mật MD5</strong><small>Mật khẩu được mã hóa 1 chiều</small></div>
+          </div>
+          <div class="feature-item">
+            <div class="feature-icon">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            </div>
+            <div><strong>Kết nối API trực tiếp</strong><small>Đồng bộ dữ liệu thời gian thực</small></div>
+          </div>
+          <div class="feature-item">
+            <div class="feature-icon">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            </div>
+            <div><strong>Dashboard cá nhân</strong><small>VIN, XU, VIP, Level đầy đủ</small></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="login-panel">
+      <div class="login-card">
+        <h2>Chào mừng trở lại 👋</h2>
+        <p class="subtitle">Đăng nhập tài khoản để tiếp tục</p>
+
+        <div class="alert error" id="alertBox">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span id="alertText"></span>
+        </div>
+
+        <form id="loginForm" autocomplete="off" novalidate>
+          <div class="field">
+            <label for="username">Tên đăng nhập</label>
+            <div class="input-box">
+              <input type="text" id="username" name="username" placeholder="Nhập tên đăng nhập" autocomplete="username" required />
+              <svg class="lead" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="password">Mật khẩu</label>
+            <div class="input-box">
+              <input type="password" id="password" name="password" placeholder="Nhập mật khẩu" autocomplete="current-password" required />
+              <svg class="lead" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              <button type="button" class="btn-eye" id="togglePass" aria-label="Hiện/ẩn mật khẩu">
+                <svg id="eyeIcon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <label class="remember">
+            <input type="checkbox" id="remember" />
+            <span class="box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            </span>
+            Ghi nhớ đăng nhập
+          </label>
+
+          <button type="submit" class="btn-submit" id="btnLogin">
+            <span class="spinner"></span>
+            <span class="btn-text">Đăng nhập</span>
+          </button>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <div class="copyright">© 2025 AUTO CƯỢC LC79 — Bản quyền thuộc về <b>HuyDaiXuVN</b></div>
+    </div>
+  </footer>
 </div>
 
-<div class="layout">
-  <div class="panel" style="max-height:calc(100vh - 92px);overflow-y:auto">
-    <div class="panel-title">🎯 Dự đoán Live</div>
+<!-- ================== DASHBOARD VIEW ================== -->
+<div id="dashboardView" style="display:none">
+  <header class="header">
+    <div class="header-inner">
+      <a href="#" class="brand">
+        <div class="brand-mark">LC79</div>
+        <div class="brand-name">
+          <strong>AUTO CƯỢC LC79</strong>
+          <small>Dashboard</small>
+        </div>
+      </a>
+      <div class="header-right">
+        <div class="user-chip">
+          <div class="avatar" id="userAvatar">U</div>
+          <span id="userChipName">User</span>
+        </div>
+        <button class="btn-logout" id="btnLogout">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+          Đăng xuất
+        </button>
+      </div>
+    </div>
+  </header>
 
-    <div class="gauge-wrap">
-      <svg class="gauge-svg" viewBox="0 0 100 100">
-        <defs>
-          <linearGradient id="ggrad" x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stop-color="#0ea5e9"/>
-            <stop offset="100%" stop-color="#6366f1"/>
-          </linearGradient>
-        </defs>
-        <circle class="gauge-track" cx="50" cy="50" r="42"/>
-        <circle class="gauge-fill" id="gauge-fill" cx="50" cy="50" r="42"
-                stroke-dasharray="0 264"/>
-      </svg>
-      <div class="gauge-value">
-        <div class="n" id="conf-num">0%</div>
-        <div class="u">Confidence</div>
+  <main class="dash">
+    <!-- Welcome -->
+    <div class="welcome-card">
+      <div class="welcome-avatar" id="welcomeAvatar">U</div>
+      <div class="welcome-info">
+        <div class="greet">Xin chào, chào mừng trở lại!</div>
+        <h2 id="welcomeName">nickname</h2>
+        <span class="level-badge" id="levelBadge">★ LV.1</span>
       </div>
     </div>
 
-    <div class="hero none" id="hero">
-      <div class="hero-label">Dự đoán AI</div>
-      <div class="hero-pred none" id="hero-pred">ĐANG TẢI...</div>
-      <div class="hero-conf"><b id="conf-detail">0%</b> độ tin cậy</div>
-      <div class="hero-cores" id="hero-cores"></div>
-      <div class="hero-regime">Regime: <b id="regime">—</b></div>
-    </div>
-
-    <div class="stats">
-      <div class="stat" id="st-balance-wrap"><div class="k">Số dư</div><div class="v" id="st-balance">-</div></div>
-      <div class="stat" id="st-pl-wrap"><div class="k">Lãi/Lỗ</div><div class="v" id="st-pl">-</div></div>
-      <div class="stat"><div class="k">Streak</div><div class="v" id="st-streak">0</div></div>
-      <div class="stat"><div class="k">Accuracy</div><div class="v" id="st-acc">0%</div></div>
-    </div>
-
-    <div class="panel-title" style="margin-top:8px">📈 Lịch sử gần đây</div>
-    <div class="history-strip" id="history-strip"></div>
-  </div>
-
-  <div class="panel" style="max-height:calc(100vh - 92px)">
-    <div class="panel-title">📊 Xu hướng 50 phiên gần nhất</div>
-    <div class="chart-wrap">
-      <canvas id="mainChart"></canvas>
-    </div>
-
-    <div class="panel-title" style="margin-top:18px">📡 Nhật ký Bot</div>
-    <div class="chat" id="chat"></div>
-  </div>
-
-  <div class="panel" style="max-height:calc(100vh - 92px)">
-    <div class="tabs">
-      <button class="tab active" onclick="switchTab('main',this)">Điều khiển</button>
-      <button class="tab" onclick="switchTab('weights',this)">AI</button>
-      <button class="tab" id="tab-admin-btn" onclick="switchTab('admin',this)" style="display:none">Admin</button>
-    </div>
-
-    <div class="tab-content active" id="tab-main">
-      <div class="panel-title">🔐 Đăng nhập Game</div>
-      <div class="field"><label>Tài khoản</label><input id="game-user" placeholder="username"></div>
-      <div class="field"><label>Mật khẩu</label><input id="game-pass" type="password" placeholder="••••••"></div>
-      <button class="btn" onclick="gameLogin()">🚀 Kết nối</button>
-
-      <div class="panel-title" style="margin-top:20px">⚙️ Cấu hình Bot</div>
-      <div class="row">
-        <button class="btn green small" onclick="autobet(true)">▶ Bật Auto</button>
-        <button class="btn red small" onclick="autobet(false)">⏸ Tắt</button>
+    <!-- Stats -->
+    <div class="stats-grid">
+      <div class="stat-card vin">
+        <div class="stat-label">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+          Số dư VIN
+        </div>
+        <div class="stat-value">
+          <span id="vinValue">—</span><span class="stat-unit">VIN</span>
+          <button class="hide-toggle" data-target="vinValue" title="Ẩn/hiện">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <div class="stat-hint">Đơn vị tiền tệ chính</div>
       </div>
-      <div class="field" style="margin-top:12px"><label>Tiền cược gốc</label>
-        <input id="bet-amount" type="number" value="10000"></div>
-      <div class="field"><label>Min Confidence % (chỉ bet khi conf ≥)</label>
-        <input id="min-conf" type="number" value="50" min="0" max="100"></div>
-      <button class="btn gray small" onclick="setMinConf()">Lưu Min Conf</button>
-      <div class="field" style="margin-top:12px"><label>Target chốt lãi</label>
-        <input id="target" type="number" placeholder="VD: 500000"></div>
-      <button class="btn small" onclick="setTarget()">🎯 Đặt Target</button>
-      <div class="row" style="margin-top:8px">
-        <button class="btn small" onclick="setX2(true)">🔥 X2 ON</button>
-        <button class="btn gray small" onclick="setX2(false)">X2 OFF</button>
-      </div>
-      <button class="btn red small" style="margin-top:12px" onclick="stopBot()">🔌 Ngắt kết nối</button>
-    </div>
 
-    <div class="tab-content" id="tab-weights">
-      <div class="panel-title">🧠 TOP Cores đang dẫn đầu</div>
-      <div id="weights-list" style="font-size:12px">Đang tải...</div>
-      <div style="margin-top:16px;font-size:11px;color:var(--muted);line-height:1.6">
-        <b style="color:#e2e8f0">Cơ chế cập nhật:</b><br>
-        • Đúng → weight tăng (max 25.0)<br>
-        • Sai → weight giảm 10% - 0.5 (min 0.1)<br>
-        • Kèm <b>regime boost</b> theo xu hướng thị trường
+      <div class="stat-card xu">
+        <div class="stat-label">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M9 10h6M9 14h6"/></svg>
+          Số dư XU
+        </div>
+        <div class="stat-value">
+          <span id="xuValue">—</span><span class="stat-unit">XU</span>
+          <button class="hide-toggle" data-target="xuValue" title="Ẩn/hiện">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <div class="stat-hint">Đơn vị phụ</div>
+      </div>
+
+      <div class="stat-card vip">
+        <div class="stat-label">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+          VIP Point
+        </div>
+        <div class="stat-value">
+          <span id="vipValue">—</span><span class="stat-unit">điểm</span>
+        </div>
+        <div class="stat-hint" id="vipHint">Điểm tích lũy thành viên</div>
       </div>
     </div>
 
-    <div class="tab-content" id="tab-admin">
-      <div class="panel-title">➕ Tạo User</div>
-      <div class="field"><label>Username</label><input id="new-username"></div>
-      <div class="field"><label>Password</label><input id="new-password" type="password"></div>
-      <button class="btn" onclick="createUser()">Tạo user</button>
-      <div class="panel-title" style="margin-top:16px">👥 Danh sách</div>
-      <div id="user-list">Đang tải...</div>
+    <!-- Info -->
+    <div class="info-card">
+      <h3>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        Thông tin tài khoản
+      </h3>
+      <div class="info-grid" id="infoGrid"></div>
     </div>
-  </div>
+
+    <!-- Raw -->
+    <details class="raw-data">
+      <summary>Xem dữ liệu thô từ API (debug)</summary>
+      <pre id="rawData">—</pre>
+    </details>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <div class="copyright">© 2025 AUTO CƯỢC LC79 — Bản quyền thuộc về <b>HuyDaiXuVN</b></div>
+    </div>
+  </footer>
 </div>
-
-<div class="toast-box" id="toast-box"></div>
 
 <script>
-const socket = io();
-let lastPrediction = null;
-let chart = null;
-let isAdmin = false;
+const API_ENDPOINT = '/api/login';
 
-// ============ BOOT ============
-(async function boot() {
+/* =========================================================
+   🔒 CHỐNG ZOOM TOÀN DIỆN
+   ========================================================= */
+let lastTouch = 0;
+document.addEventListener('touchend', (e) => {
+  const now = Date.now();
+  if (now - lastTouch <= 300) e.preventDefault();
+  lastTouch = now;
+}, { passive: false });
+
+['gesturestart', 'gesturechange', 'gestureend'].forEach(ev => {
+  document.addEventListener(ev, e => e.preventDefault(), { passive: false });
+});
+
+document.addEventListener('wheel', (e) => {
+  if (e.ctrlKey) e.preventDefault();
+}, { passive: false });
+
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && ['+', '-', '=', '0'].includes(e.key)) {
+    e.preventDefault();
+  }
+});
+
+document.addEventListener('touchmove', (e) => {
+  if (e.touches.length > 1) e.preventDefault();
+}, { passive: false });
+
+/* =========================================================
+   HELPERS
+   ========================================================= */
+const $ = id => document.getElementById(id);
+
+function showError(msg) {
+  $('alertText').textContent = msg;
+  $('alertBox').classList.add('show');
+}
+function hideError() { $('alertBox').classList.remove('show'); }
+
+function formatNumber(v) {
+  if (v === null || v === undefined || v === '') return '0';
+  const n = Number(v);
+  if (isNaN(n)) return String(v);
+  return new Intl.NumberFormat('vi-VN').format(n);
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function decodeSessionKey(sk) {
+  if (!sk) return null;
   try {
-    const r = await fetch('/api/me');
-    const d = await r.json();
-    if (d.error) { window.location.href = '/login'; return; }
-    document.getElementById('u-name').textContent = d.username;
-    if (d.is_vip) document.getElementById('u-vip').style.display = '';
-    if (d.is_admin) {
-      document.getElementById('u-admin').style.display = '';
-      document.getElementById('tab-admin-btn').style.display = '';
-      isAdmin = true;
-    }
-  } catch(e) { window.location.href = '/login'; }
-})();
-
-// ============ TOAST ============
-function toast(text, type='info') {
-  const box = document.getElementById('toast-box');
-  const el = document.createElement('div');
-  el.className = 'toast ' + type;
-  el.textContent = text;
-  box.appendChild(el);
-  setTimeout(() => { el.style.animation = 'toastOut .3s forwards';
-    setTimeout(() => el.remove(), 300); }, 3500);
+    const json = atob(sk);
+    return JSON.parse(json);
+  } catch (e) {
+    console.error('[DECODE sessionKey]', e);
+    return null;
+  }
 }
 
-// ============ CHAT ============
-function addMessage(html) {
-  const c = document.getElementById('chat');
-  const div = document.createElement('div');
-  div.className = 'msg';
-  if (html.indexOf('HÚP') >= 0 || html.indexOf('ĐẠT TARGET') >= 0) div.classList.add('win');
-  else if (html.indexOf('GÃY CẦU') >= 0) div.classList.add('loss');
-  div.innerHTML = html.replace(/\\n/g, '<br>');
-  c.appendChild(div);
-  c.scrollTop = c.scrollHeight;
-  while (c.children.length > 400) c.removeChild(c.firstChild);
+function isLoginSuccess(d) {
+  return d && d.success === true && String(d.errorCode) === '0' && !!d.sessionKey;
 }
 
-// ============ SOCKET ============
-socket.on('connect', () => {
-  document.getElementById('live-indicator').innerHTML =
-    '<span class="live-dot"></span><span id="live-text">Live</span>';
-  addMessage('🟢 <b>WebSocket đã kết nối</b>');
+/* =========================================================
+   HIỆN/ẨN MẬT KHẨU
+   ========================================================= */
+const eyeOpen = `<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>`;
+const eyeClosed = `<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>`;
+$('togglePass').addEventListener('click', () => {
+  const pw = $('password');
+  const show = pw.type === 'password';
+  pw.type = show ? 'text' : 'password';
+  $('eyeIcon').innerHTML = show ? eyeClosed : eyeOpen;
 });
-socket.on('disconnect', () => {
-  document.getElementById('live-indicator').innerHTML =
-    '<span class="live-dot off"></span><span id="live-text">Offline</span>';
-  addMessage('🔴 <b>WebSocket mất kết nối</b>');
-});
-socket.on('bot_message', m => addMessage(m.text));
-socket.on('state_update', updateState);
 
-function updateState(s) {
-  const hero = document.getElementById('hero');
-  const hp = document.getElementById('hero-pred');
-  const hc = document.getElementById('hero-cores');
-  const rg = document.getElementById('regime');
-
-  hero.className = 'hero';
-  hp.className = 'hero-pred';
-  if (s.prediction === 'TAI') {
-    hero.classList.add('tai'); hp.classList.add('tai'); hp.textContent = '🔵 TÀI';
-  } else if (s.prediction === 'XIU') {
-    hero.classList.add('xiu'); hp.classList.add('xiu'); hp.textContent = '🔴 XỈU';
-  } else {
-    hero.classList.add('none'); hp.classList.add('none'); hp.textContent = 'ĐANG TÍNH...';
-  }
-  document.getElementById('conf-detail').textContent = (s.confidence||0) + '%';
-  if (s.top_models && s.top_models.length) {
-    hc.innerHTML = 'Top cores: ' + s.top_models.slice(0,3)
-      .map(x => '<code>' + x[0] + '</code>').join('');
-  } else { hc.innerHTML = ''; }
-  rg.textContent = s.regime ? s.regime.toUpperCase() : '—';
-
-  const pct = Math.max(0, Math.min(100, s.confidence || 0));
-  document.getElementById('gauge-fill').setAttribute('stroke-dasharray',
-    ((pct/100)*264).toFixed(1) + ' 264');
-  document.getElementById('conf-num').textContent = Math.round(pct) + '%';
-
-  document.getElementById('st-balance').textContent = (s.balance||0).toLocaleString();
-  document.getElementById('st-pl').textContent = (s.profit_loss||0).toLocaleString();
-  document.getElementById('st-pl-wrap').className = 'stat ' +
-    ((s.profit_loss||0) >= 0 ? 'pos' : 'neg');
-  document.getElementById('st-streak').textContent = s.win_streak || 0;
-  const acc = s.pred_total > 0 ? (s.pred_correct / s.pred_total * 100).toFixed(1) : '0.0';
-  document.getElementById('st-acc').textContent = acc + '%';
-
-  const strip = document.getElementById('history-strip');
-  if (s.history_tail && s.history_tail.length) {
-    strip.innerHTML = s.history_tail.slice(-30).map(r =>
-      '<div class="history-chip ' + (r==='TAI'?'tai':'xiu') + '">' +
-      (r==='TAI'?'T':'X') + '</div>'
-    ).join('');
-  }
-
-  updateChart(s.history_tail || []);
-
-  if (s.prediction && s.prediction !== lastPrediction) {
-    lastPrediction = s.prediction;
-    toast('AI chốt: ' + (s.prediction === 'TAI' ? '🔵 TÀI' : '🔴 XỈU') +
-      ' (' + s.confidence + '%)', s.confidence >= 60 ? 'success' : 'info');
-  }
-
-  if (s.min_confidence !== undefined) {
-    document.getElementById('min-conf').value = s.min_confidence;
-  }
+/* =========================================================
+   ĐĂNG NHẬP & XỬ LÝ GIAO DIỆN DASHBOARD
+   ========================================================= */
+const savedUser = localStorage.getItem('lc79_user');
+if (savedUser) {
+  $('username').value = savedUser;
+  $('remember').checked = true;
 }
 
-// ============ CHART ============
-function updateChart(history) {
-  const ctx = document.getElementById('mainChart').getContext('2d');
-  const tail = history.slice(-50);
-  const labels = tail.map((_, i) => i + 1);
-  const data = tail.map(r => r === 'TAI' ? 1 : -1);
-  const colors = tail.map(r => r === 'TAI' ? '#0ea5e9' : '#ef4444');
+$('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  hideError();
 
-  if (!chart) {
-    chart = new Chart(ctx, {
-      type: 'bar',
-      data: { labels, datasets: [{ data, backgroundColor: colors,
-              borderRadius: 3, borderSkipped: false }]},
-      options: {
-        responsive: true, maintainAspectRatio: false, animation: {duration: 300},
-        plugins: { legend: {display: false}, tooltip: {
-          callbacks: { label: c => c.raw === 1 ? '🔵 TÀI' : '🔴 XỈU' }
-        }},
-        scales: { y: { display: false, min: -1.2, max: 1.2 },
-                  x: { display: false } }
-      }
+  const username = $('username').value.trim();
+  const password = $('password').value;
+
+  if (!username || !password) {
+    showError('Vui lòng nhập đầy đủ tên đăng nhập và mật khẩu.');
+    return;
+  }
+
+  // Mã hóa mật khẩu MD5 (sử dụng CryptoJS đã include)
+  const passwordMd5 = CryptoJS.MD5(password).toString();
+
+  const btn = $('btnLogin');
+  btn.classList.add('loading');
+  btn.disabled = true;
+
+  try {
+    const res = await fetch(API_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password: passwordMd5 })
     });
-  } else {
-    chart.data.labels = labels;
-    chart.data.datasets[0].data = data;
-    chart.data.datasets[0].backgroundColor = colors;
-    chart.update('none');
+    
+    const data = await res.json();
+
+    if (isLoginSuccess(data)) {
+      if ($('remember').checked) {
+        localStorage.setItem('lc79_user', username);
+      } else {
+        localStorage.removeItem('lc79_user');
+      }
+
+      // Hiển thị Dashboard và ẩn Login
+      $('loginView').style.display = 'none';
+      $('dashboardView').style.display = 'block';
+
+      // Giải mã sessionKey (Base64 chứa JSON thô thực tế)
+      const parsedData = decodeSessionKey(data.sessionKey) || {};
+      
+      const nick = parsedData.nickname || username;
+      const initial = nick.charAt(0).toUpperCase();
+
+      $('userAvatar').textContent = initial;
+      $('userChipName').textContent = nick;
+      $('welcomeAvatar').textContent = initial;
+      $('welcomeName').textContent = nick;
+      
+      // Ánh xạ dữ liệu thực tế từ sessionKey trả về
+      $('vinValue').textContent = formatNumber(parsedData.vinTotal || 0);
+      $('xuValue').textContent = formatNumber(parsedData.xuTotal || 0);
+      $('vipValue').textContent = formatNumber(parsedData.vippoint || 0);
+      $('levelBadge').textContent = `★ LV.${data.curLevel || 1}`;
+
+      // Bảng thông tin tài khoản chi tiết
+      const infoGrid = $('infoGrid');
+      infoGrid.innerHTML = `
+        <div class="info-item"><div class="info-key">Tên nhân vật</div><div class="info-value mono">${escapeHtml(parsedData.nickname || 'N/A')}</div></div>
+        <div class="info-item"><div class="info-key">Địa chỉ IP</div><div class="info-value mono">${escapeHtml(parsedData.ipAddress || 'N/A')}</div></div>
+        <div class="info-item"><div class="info-key">Ngày tạo</div><div class="info-value mono">${escapeHtml(parsedData.createTime || 'N/A')}</div></div>
+        <div class="info-item"><div class="info-key">Cấp độ (Level)</div><div class="info-value ok">${escapeHtml(data.curLevel || 1)}</div></div>
+      `;
+
+      $('rawData').textContent = JSON.stringify(data, null, 2);
+
+    } else {
+      showError(data.message || 'Đăng nhập thất bại, vui lòng kiểm tra lại thông tin.');
+    }
+  } catch (err) {
+    console.error(err);
+    showError('Không thể kết nối đến máy chủ API.');
+  } finally {
+    btn.classList.remove('loading');
+    btn.disabled = false;
   }
-}
+});
 
-// ============ API ============
-async function api(url, body) {
-  const r = await fetch(url, {method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(body||{})});
-  return await r.json();
-}
+// Đăng xuất
+$('btnLogout').addEventListener('click', () => {
+  $('dashboardView').style.display = 'none';
+  $('loginView').style.display = 'block';
+  $('password').value = '';
+  hideError();
+});
 
-async function gameLogin() {
-  const u = document.getElementById('game-user').value.trim();
-  const p = document.getElementById('game-pass').value;
-  if (!u || !p) return toast('Nhập đủ tài khoản + mật khẩu', 'error');
-  toast('Đang kết nối...', 'info');
-  const d = await api('/api/game-login', {username:u, password:p});
-  if (d.error) toast(d.error, 'error');
-  else toast('✅ Đã kết nối: ' + d.nickname, 'success');
-}
-
-async function autobet(enabled) {
-  const amount = parseInt(document.getElementById('bet-amount').value) || 10000;
-  const d = await api('/api/autobet', {enabled, amount});
-  if (d.error) toast(d.error, 'error');
-  else toast(enabled ? '✅ Auto BẬT · Cược ' + amount.toLocaleString() : '🔴 Auto TẮT', 'info');
-}
-
-async function setMinConf() {
-  const v = parseInt(document.getElementById('min-conf').value) || 50;
-  const d = await api('/api/min-conf', {value: v});
-  if (d.error) toast(d.error, 'error');
-  else toast('✅ Min confidence: ' + v + '%', 'success');
-}
-
-async function setTarget() {
-  const t = parseInt(document.getElementById('target').value);
-  if (!t) return toast('Nhập số target', 'error');
-  const d = await api('/api/chotlai', {target:t});
-  if (d.error) toast(d.error, 'error');
-  else toast('🎯 Target: ' + t.toLocaleString(), 'success');
-}
-
-async function setX2(enabled) {
-  const d = await api('/api/x2', {enabled});
-  if (d.error) toast(d.error, 'error');
-  else toast('X2: ' + (enabled ? 'BẬT' : 'TẮT'), 'info');
-}
-
-async function stopBot() {
-  if (!confirm('Ngắt kết nối?')) return;
-  await api('/api/stop', {});
-  toast('🔌 Đã ngắt', 'info');
-}
-
-async function loadWeights() {
-  const r = await fetch('/api/weights');
-  const d = await r.json();
-  if (d.error) return;
-  const max = Math.max.apply(null, d.weights.map(w => w[1]));
-  document.getElementById('weights-list').innerHTML =
-    '<div style="color:#64748b;margin-bottom:10px;font-size:11px">Data: ' +
-    d.history_len + ' vòng</div>' +
-    d.weights.map(w =>
-      '<div class="weight-row">' +
-        '<span class="name">' + w[0] + '</span>' +
-        '<div class="bar"><div style="width:' + ((w[1]/max)*100).toFixed(0) + '%"></div></div>' +
-        '<span class="val">' + w[1].toFixed(2) + '</span>' +
-      '</div>'
-    ).join('');
-}
-
-async function createUser() {
-  const un = document.getElementById('new-username').value.trim();
-  const pw = document.getElementById('new-password').value;
-  if (!un || !pw) return toast('Nhập đủ', 'error');
-  const d = await api('/api/admin/create', {username:un, password:pw, is_vip:true});
-  if (d.error) toast(d.error, 'error');
-  else { toast('✅ Đã tạo user', 'success'); loadUsers(); }
-}
-
-async function loadUsers() {
-  const r = await fetch('/api/admin/users');
-  const d = await r.json();
-  if (d.error) return;
-  document.getElementById('user-list').innerHTML = Object.keys(d).map(u => {
-    const info = d[u];
-    return '<div class="user-row">' +
-      '<div class="info"><b>' + u + '</b>' +
-      (info.is_admin ? ' <span class="badge admin">ADMIN</span>' : '') +
-      (info.is_vip ? ' <span class="badge vip">VIP</span>' : '') +
-      '</div><div class="actions">' +
-      '<button style="background:#22c55e" onclick="setVip(\'' + u + '\',' + (!info.is_vip) + ')">' +
-        (info.is_vip?'Bỏ VIP':'Cấp VIP') + '</button>' +
-      '<button style="background:#ef4444" onclick="delUser(\'' + u + '\')">Xóa</button>' +
-      '</div></div>';
-  }).join('');
-}
-
-async function setVip(username, is_vip) {
-  const d = await api('/api/admin/set-vip', {username, is_vip});
-  if (d.error) toast(d.error, 'error');
-  else { toast('Đã cập nhật', 'success'); loadUsers(); }
-}
-async function delUser(username) {
-  if (!confirm('Xóa user ' + username + '?')) return;
-  const d = await api('/api/admin/delete', {username});
-  if (d.error) toast(d.error, 'error');
-  else { toast('Đã xóa', 'success'); loadUsers(); }
-}
-
-function switchTab(name, el) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-  el.classList.add('active');
-  document.getElementById('tab-' + name).classList.add('active');
-  if (name === 'weights') loadWeights();
-  if (name === 'admin') loadUsers();
-}
-
-async function logout() {
-  await fetch('/api/logout', {method:'POST'});
-  window.location.href = '/login';
-}
-
-setInterval(() => {
-  const w = document.getElementById('tab-weights');
-  if (w && w.classList.contains('active')) loadWeights();
-}, 10000);
+// Ẩn hiện số dư
+document.querySelectorAll('.hide-toggle').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const targetId = btn.getAttribute('data-target');
+    const el = $(targetId);
+    if (el.textContent === '••••••') {
+      el.textContent = el.dataset.value || '0';
+    } else {
+      el.dataset.value = el.textContent;
+      el.textContent = '••••••';
+    }
+  });
+});
 </script>
-</body></html>"""
+</body>
+</html>
+"""
 
-# ==========================================
-# ROUTES
-# ==========================================
 @app.route('/')
 def index():
-    if 'user' not in session: return redirect('/login')
-    return INDEX_HTML
-
-@app.route('/login')
-def login_page(): return LOGIN_HTML
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/api/login', methods=['POST'])
 def api_login():
-    d = request.json or {}
-    username = (d.get('username') or '').strip()
-    if username not in USERS or USERS[username]['password'] != hash_pw(d.get('password') or ''):
-        return jsonify({"error": "Sai tài khoản/mật khẩu"}), 401
-    session['user'] = username
-    session.permanent = True
-    init_user_state(username)
-    return jsonify({"ok": True, "is_admin": USERS[username]['is_admin'],
-                    "is_vip": USERS[username]['is_vip']})
-
-@app.route('/api/logout', methods=['POST'])
-def api_logout(): session.clear(); return jsonify({"ok": True})
-
-@app.route('/api/me')
-@require_login
-def api_me():
-    u = USERS[session['user']]
-    return jsonify({"username": session['user'], "is_admin": u['is_admin'],
-                    "is_vip": u['is_vip'], "history_len": len(GLOBAL_HISTORY)})
-
-@app.route('/api/game-login', methods=['POST'])
-@require_vip
-def api_game_login():
-    user = session['user']; d = request.json or {}
-    res = login_and_get_token(d.get('username',''), d.get('password',''))
-    if '_error' in res: return jsonify({"error": res['_error']}), 400
-    init_user_state(user)
-    with state_lock:
-        user_states[user]['balance'] = res['money']
-    send_msg(user, f"🎉 <b>ĐĂNG NHẬP THÀNH CÔNG</b>\n👤 <code>{res['nickname']}</code>\n💰 Dư: <code>{res['money']:,}</code>\n🌍 Data: {len(GLOBAL_HISTORY)} vòng")
-    threading.Thread(target=start_websocket, args=(user, res['token']), daemon=True).start()
-    return jsonify({"ok": True, "nickname": res['nickname'], "money": res['money']})
-
-@app.route('/api/autobet', methods=['POST'])
-@require_vip
-def api_autobet():
-    user = session['user']
-    if user not in user_states: return jsonify({"error": "Chưa login game"}), 400
-    d = request.json or {}
-    with state_lock:
-        if d.get('enabled'):
-            amt = int(d.get('amount', 10000))
-            user_states[user]['auto_bet_enabled'] = True
-            user_states[user]['base_bet_amount'] = amt
-        else:
-            user_states[user]['auto_bet_enabled'] = False
-    send_msg(user, f"✅ <b>AUTO BET: BẬT</b>\n💸 Vốn: <code>{d.get('amount',10000):,}</code>"
-             if d.get('enabled') else "🔴 <b>AUTO BET: TẮT</b>")
-    send_state(user)
-    return jsonify({"ok": True})
-
-@app.route('/api/min-conf', methods=['POST'])
-@require_vip
-def api_min_conf():
-    user = session['user']
-    if user not in user_states: return jsonify({"error": "Chưa login game"}), 400
-    v = int((request.json or {}).get('value', 50))
-    with state_lock:
-        user_states[user]['min_confidence'] = max(0, min(100, v))
-    send_msg(user, f"🎯 Min confidence = <b>{v}%</b>")
-    send_state(user)
-    return jsonify({"ok": True})
-
-@app.route('/api/x2', methods=['POST'])
-@require_vip
-def api_x2():
-    user = session['user']
-    if user not in user_states: return jsonify({"error": "Chưa login game"}), 400
-    e = bool((request.json or {}).get('enabled'))
-    with state_lock:
-        user_states[user]['x2_mode'] = e
-    send_msg(user, f"🔥 <b>X2: {'BẬT' if e else 'TẮT'}</b>")
-    send_state(user)
-    return jsonify({"ok": True})
-
-@app.route('/api/chotlai', methods=['POST'])
-@require_vip
-def api_chotlai():
-    user = session['user']
-    if user not in user_states: return jsonify({"error": "Chưa login game"}), 400
+    data = request.json
+    username = data.get('username')
+    password_md5 = data.get('password') # Chuỗi đã mã hóa MD5 từ giao diện gửi lên
+    
+    # URL API thực tế theo yêu cầu
+    target_url = "https://apifo88daigia.tele68.com/api"
+    
+    # Các tham số query chuẩn theo cấu trúc mẫu
+    params = {
+        "c": 3,
+        "un": username,
+        "pw": password_md5,
+        "cp": "R",
+        "cl": "R",
+        "pf": "web"
+    }
+    
     try:
-        t = int((request.json or {}).get('target', 0))
-        with state_lock:
-            user_states[user]['target_profit'] = t
-        send_msg(user, f"🎯 <b>TARGET:</b> <code>{t:,}</code>")
-        send_state(user)
-        return jsonify({"ok": True})
-    except: return jsonify({"error": "Số không hợp lệ"}), 400
+        # Gọi request thật đến API external
+        response = requests.get(target_url, params=params, timeout=10)
+        api_result = response.json()
+        return jsonify(api_result)
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "errorCode": "-1",
+            "message": f"Lỗi kết nối API: {str(e)}"
+        })
 
-@app.route('/api/stats')
-@require_vip
-def api_stats():
-    user = session['user']
-    if user not in user_states: return jsonify({"error": "Chưa login game"}), 400
-    with state_lock:
-        s = dict(user_states[user]); s.pop('last_predictions', None)
-    return jsonify(s)
-
-@app.route('/api/weights')
-@require_vip
-def api_weights():
-    top = sorted(GLOBAL_AI_WEIGHTS.items(), key=lambda x: x[1], reverse=True)[:15]
-    return jsonify({"weights": top, "history_len": len(GLOBAL_HISTORY)})
-
-@app.route('/api/stop', methods=['POST'])
-@require_vip
-def api_stop():
-    user = session['user']
-    if user in active_sockets:
-        try: active_sockets[user].disconnect()
-        except: pass
-        del active_sockets[user]
-    send_msg(user, "🔌 Đã ngắt kết nối.")
-    return jsonify({"ok": True})
-
-@app.route('/api/admin/users')
-@require_login
-def api_admin_users():
-    if not USERS[session['user']]['is_admin']: return jsonify({"error": "Forbidden"}), 403
-    return jsonify({u: {"is_admin": d['is_admin'], "is_vip": d['is_vip']}
-                    for u, d in USERS.items()})
-
-@app.route('/api/admin/create', methods=['POST'])
-@require_login
-def api_admin_create():
-    if not USERS[session['user']]['is_admin']: return jsonify({"error": "Forbidden"}), 403
-    d = request.json or {}
-    un = (d.get('username') or '').strip()
-    if not un or not d.get('password'): return jsonify({"error": "Thiếu thông tin"}), 400
-    if un in USERS: return jsonify({"error": "User đã tồn tại"}), 400
-    USERS[un] = {"password": hash_pw(d['password']), "is_admin": False,
-                 "is_vip": bool(d.get('is_vip', True))}
-    save_users(USERS)
-    return jsonify({"ok": True})
-
-@app.route('/api/admin/set-vip', methods=['POST'])
-@require_login
-def api_admin_set_vip():
-    if not USERS[session['user']]['is_admin']: return jsonify({"error": "Forbidden"}), 403
-    d = request.json or {}; u = d.get('username')
-    if u not in USERS: return jsonify({"error": "User không tồn tại"}), 404
-    USERS[u]['is_vip'] = bool(d.get('is_vip'))
-    save_users(USERS)
-    return jsonify({"ok": True})
-
-@app.route('/api/admin/delete', methods=['POST'])
-@require_login
-def api_admin_delete():
-    if not USERS[session['user']]['is_admin']: return jsonify({"error": "Forbidden"}), 403
-    u = (request.json or {}).get('username')
-    if u == session['user']: return jsonify({"error": "Không tự xóa mình"}), 400
-    if u in USERS: del USERS[u]; save_users(USERS)
-    return jsonify({"ok": True})
-
-# ==========================================
-# WEB SOCKET
-# ==========================================
-@web_socketio.on('connect')
-def on_web_connect():
-    user = session.get('user')
-    if user:
-        join_room(f"user_{user}")
-        send_state(user)
-
-# ==========================================
-# MAIN
-# ==========================================
-if __name__ == "__main__":
-    print("=" * 60)
-    print("🤖 AI TÀI XỈU ULTRA V5 — FLASK LIVE WEB")
-    print("🌐 http://localhost:5000  (admin / admin123)")
-    print("=" * 60)
-    threading.Thread(target=background_data_collector, daemon=True).start()
-    web_socketio.run(app, host='0.0.0.0', port=5000, debug=False,
-                     allow_unsafe_werkzeug=True)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
