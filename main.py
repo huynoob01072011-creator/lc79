@@ -20,10 +20,15 @@ logging.getLogger('engineio').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 app = Flask(__name__)
-
 MAX_GLOBAL_HISTORY = 2000
 
-# Global AI State
+# 🔴 BACKGROUND COLLECTOR ACCOUNT (auto login chạy ngầm)
+DATA_COLLECTOR_USER = "HuyDaiXuLC79"
+DATA_COLLECTOR_PASS = "GiaHuy2011@"
+
+# ==========================================
+# GLOBAL STATE
+# ==========================================
 GLOBAL_HISTORY = []
 GLOBAL_AI_WEIGHTS = {
     "trend": 1.0, "pattern": 1.0, "frequency": 1.0, "momentum": 1.0, "symmetry": 1.0,
@@ -45,6 +50,19 @@ GLOBAL_LAST_SESSION_ID = None
 GLOBAL_PROCESSED_SESSIONS = set()
 GLOBAL_LOCK = threading.Lock()
 
+# Background collector status
+BG_STATE = {
+    "running": False,
+    "connected": False,
+    "nickname": None,
+    "session_id": None,
+    "last_seen": None,
+    "login_count": 0,
+    "error": None
+}
+BG_LOCK = threading.Lock()
+BG_THREAD_STARTED = False
+
 USER_SESSIONS = {}
 USERNAME_TO_TOKEN = {}
 SESSION_LOCK = threading.Lock()
@@ -55,7 +73,7 @@ def md5_hash(text: str) -> str:
 
 
 # ==========================================
-# 🧠 35 LÕI AI - DỰ ĐOÁN
+# 🧠 35 LÕI AI
 # ==========================================
 def make_prediction_vip():
     with GLOBAL_LOCK:
@@ -158,12 +176,17 @@ def make_prediction_vip():
 
 
 # ==========================================
-# 🔐 LOGIN API
+# 🔐 LOGIN — HASH SERVER-SIDE (giống hệt bot)
 # ==========================================
-def do_login(username, password_md5):
+def do_login(username: str, password: str):
+    """
+    Nhận PLAINTEXT password, hash MD5 ở server-side giống hệt bot code.
+    Trả về đầy đủ session_data đã decode.
+    """
     try:
-        url = f"https://apifo88daigia.tele68.com/api?c=3&un={username}&pw={password_md5}&cp=R&cl=R&pf=web&at="
-        r = requests.get(url, timeout=12)
+        pw_md5 = md5_hash(password)
+        url = f"https://apifo88daigia.tele68.com/api?c=3&un={username}&pw={pw_md5}&cp=R&cl=R&pf=web&at="
+        r = requests.get(url, timeout=15)
         r.raise_for_status()
         data = r.json()
 
@@ -179,7 +202,7 @@ def do_login(username, password_md5):
         r2 = requests.post(
             "https://wlb.tele68.com/v1/lobby/auth/login?cp=R&cl=R&pf=web&at=",
             headers={"authority": "wlb.tele68.com", "content-type": "application/json"},
-            json={"nickName": nickname, "accessToken": access_token}, timeout=12
+            json={"nickName": nickname, "accessToken": access_token}, timeout=15
         )
         lobby = r2.json()
         game_token = lobby.get("token")
@@ -193,6 +216,8 @@ def do_login(username, password_md5):
             "nickname": nickname,
             "money": lobby.get("remoteLoginResp", {}).get("money", 0),
             "session_data": session_data,
+            "pw_md5": pw_md5,     # debug — chứng minh hash real
+            "access_token": access_token[:20] + "...",  # debug
             "raw": data
         }
     except Exception as e:
@@ -200,7 +225,43 @@ def do_login(username, password_md5):
 
 
 # ==========================================
-# 🌐 GAME SOCKET (theo từng user)
+# 🛰️ BACKGROUND COLLECTOR — chạy 24/7 (giống bot)
+# ==========================================
+def background_data_collector():
+    logger.info("🚀 Background Collector bắt đầu (HuyDaiXuLC79)")
+    with BG_LOCK:
+        BG_STATE["running"] = True
+
+    while True:
+        try:
+            result = do_login(DATA_COLLECTOR_USER, DATA_COLLECTOR_PASS)
+            if not result.get("success"):
+                logger.error(f"BG login fail: {result.get('message')}")
+                with BG_LOCK:
+                    BG_STATE["error"] = result.get("message")
+                time.sleep(20)
+                continue
+
+            logger.info(f"✅ BG login OK: {result['nickname']} | Money: {result['money']:,}")
+            with BG_LOCK:
+                BG_STATE["nickname"] = result["nickname"]
+                BG_STATE["login_count"] += 1
+                BG_STATE["error"] = None
+                BG_STATE["last_seen"] = time.time()
+
+            start_game_socket("BACKGROUND_WORKER", result["game_token"], is_background=True)
+        except Exception as e:
+            logger.error(f"BG collector error: {e}")
+            with BG_LOCK:
+                BG_STATE["error"] = str(e)
+
+        with BG_LOCK:
+            BG_STATE["connected"] = False
+        time.sleep(20)
+
+
+# ==========================================
+# 🌐 GAME SOCKET (WSS REAL)
 # ==========================================
 def add_log(token_id, msg):
     with SESSION_LOCK:
@@ -213,39 +274,44 @@ def add_log(token_id, msg):
                 USER_SESSIONS[token_id]["log"] = USER_SESSIONS[token_id]["log"][-100:]
 
 
-def start_game_socket(token_id, game_token):
-    with SESSION_LOCK:
-        if token_id not in USER_SESSIONS:
-            return
-
-    sio = socketio.Client(reconnection=True, reconnection_attempts=20, logger=False, engineio_logger=False)
-
-    @sio.event(namespace='/txmd5')
-    def connect():
-        with SESSION_LOCK:
-            if token_id in USER_SESSIONS:
-                USER_SESSIONS[token_id]["game_connected"] = True
-        add_log(token_id, "✅ Đã kết nối game server")
-
-    @sio.event(namespace='/txmd5')
-    def disconnect():
-        with SESSION_LOCK:
-            if token_id in USER_SESSIONS:
-                USER_SESSIONS[token_id]["game_connected"] = False
-        add_log(token_id, "❌ Mất kết nối game server")
-
-    @sio.on('new-session', namespace='/txmd5')
-    def on_new_session(data):
+def start_game_socket(token_id, game_token, is_background=False):
+    if not is_background:
         with SESSION_LOCK:
             if token_id not in USER_SESSIONS:
                 return
-            session = USER_SESSIONS[token_id]
-            session["session_id"] = data.get('id', 'N/A')
-            session["has_bet_this_session"] = False
-            session["dices"] = None
-            my_session_id = session["session_id"]
 
-        # Dự đoán (chỉ chạy 1 lần/session)
+    sio = socketio.Client(reconnection=True, reconnection_attempts=50, logger=False, engineio_logger=False)
+
+    @sio.event(namespace='/txmd5')
+    def connect():
+        if is_background:
+            logger.info("[BG] ✅ WSS connected")
+            with BG_LOCK:
+                BG_STATE["connected"] = True
+                BG_STATE["last_seen"] = time.time()
+        else:
+            with SESSION_LOCK:
+                if token_id in USER_SESSIONS:
+                    USER_SESSIONS[token_id]["game_connected"] = True
+            add_log(token_id, "✅ WSS kết nối thành công")
+
+    @sio.event(namespace='/txmd5')
+    def disconnect():
+        if is_background:
+            logger.warning("[BG] ❌ WSS disconnected")
+            with BG_LOCK:
+                BG_STATE["connected"] = False
+        else:
+            with SESSION_LOCK:
+                if token_id in USER_SESSIONS:
+                    USER_SESSIONS[token_id]["game_connected"] = False
+            add_log(token_id, "❌ WSS mất kết nối")
+
+    @sio.on('new-session', namespace='/txmd5')
+    def on_new_session(data):
+        my_session_id = data.get('id', 'N/A')
+
+        # Global prediction — AI dùng chung cho mọi kết nối
         with GLOBAL_LOCK:
             if GLOBAL_LAST_SESSION_ID != my_session_id or GLOBAL_CURRENT_PREDICTION is None:
                 pred, model_preds = make_prediction_vip()
@@ -253,31 +319,45 @@ def start_game_socket(token_id, game_token):
                 GLOBAL_LAST_PREDICTIONS.update(model_preds)
                 GLOBAL_LAST_SESSION_ID = my_session_id
                 GLOBAL_CURRENT_PREDICTION = pred
-                logger.info(f"AI Dự đoán phiên {my_session_id}: {pred}")
+                logger.info(f"🧠 AI dự đoán phiên {my_session_id}: {pred}")
             current_pred = GLOBAL_CURRENT_PREDICTION
+
+        if is_background:
+            with BG_LOCK:
+                BG_STATE["session_id"] = my_session_id
+                BG_STATE["last_seen"] = time.time()
+            return
 
         with SESSION_LOCK:
             if token_id not in USER_SESSIONS:
                 return
             session = USER_SESSIONS[token_id]
+            is_new_session = session["session_id"] != my_session_id
+            session["session_id"] = my_session_id
+            if is_new_session:
+                session["has_bet_this_session"] = False
+                session["current_result"] = None
+                session["dices"] = None
+
             session["current_prediction"] = current_pred
 
-            # X2 logic: thắng ≥1 → bet × 2, thua reset về base
             if session["x2_mode"] and session["win_streak"] >= 1:
                 session["current_bet"] = session["base_bet"] * 2
             else:
                 session["current_bet"] = session["base_bet"]
 
-            # Kiểm tra target
-            if session["auto_bet"] and session["target_profit"] is not None and session["target_profit"] > 0:
-                if session["profit_loss"] >= session["target_profit"]:
-                    session["auto_bet"] = False
-                    add_log(token_id, f"🏆 ĐẠT TARGET +{session['target_profit']:,} — TẮT AUTO")
+            if (session["auto_bet"] and session["target_profit"]
+                    and session["target_profit"] > 0
+                    and session["profit_loss"] >= session["target_profit"]):
+                session["auto_bet"] = False
+                add_log(token_id, f"🏆 ĐẠT TARGET +{session['target_profit']:,} — TẮT AUTO")
 
-        add_log(token_id, f"🔔 Phiên {my_session_id} | Dự đoán: {current_pred} | Cược: {session['current_bet']:,}")
+        add_log(token_id, f"🔔 Phiên {my_session_id} | {current_pred} | Cược: {session['current_bet']:,}")
 
     @sio.on('tick-update', namespace='/txmd5')
     def on_tick_update(data):
+        if is_background:
+            return
         game_state = data.get('state')
         with SESSION_LOCK:
             if token_id not in USER_SESSIONS:
@@ -292,12 +372,14 @@ def start_game_socket(token_id, game_token):
                     }, namespace='/txmd5')
                     session["has_bet_this_session"] = True
                     session["waiting_for_result"] = True
-                    add_log(token_id, f"🚀 Đặt cược {session['current_bet']:,} → {session['current_prediction']}")
+                    add_log(token_id, f"🚀 BET REAL: {session['current_bet']:,} → {session['current_prediction']}")
                 except Exception as e:
-                    add_log(token_id, f"⚠️ Lỗi đặt cược: {e}")
+                    add_log(token_id, f"⚠️ Lỗi bet: {e}")
 
     @sio.on('bet-result', namespace='/txmd5')
     def on_bet_result(data):
+        if is_background:
+            return
         with SESSION_LOCK:
             if token_id in USER_SESSIONS and "postBalance" in data:
                 USER_SESSIONS[token_id]["balance"] = data["postBalance"]
@@ -311,13 +393,18 @@ def start_game_socket(token_id, game_token):
         result = data.get('resultTruyenThong', 'N/A')
         dices = data.get('dices', [0, 0, 0])
 
-        with SESSION_LOCK:
-            if token_id not in USER_SESSIONS:
-                return
-            my_session_id = USER_SESSIONS[token_id].get("session_id")
+        if is_background:
+            with BG_LOCK:
+                my_session_id = BG_STATE["session_id"]
+                BG_STATE["last_seen"] = time.time()
+        else:
+            with SESSION_LOCK:
+                if token_id not in USER_SESSIONS:
+                    return
+                my_session_id = USER_SESSIONS[token_id].get("session_id")
 
-        # Cập nhật history & weights (chỉ 1 lần/session)
-        if result in ["TAI", "XIU"]:
+        # Cập nhật history (dedup theo session_id)
+        if result in ["TAI", "XIU"] and my_session_id:
             with GLOBAL_LOCK:
                 if my_session_id not in GLOBAL_PROCESSED_SESSIONS:
                     GLOBAL_PROCESSED_SESSIONS.add(my_session_id)
@@ -336,6 +423,13 @@ def start_game_socket(token_id, game_token):
 
                     if len(GLOBAL_PROCESSED_SESSIONS) > 1000:
                         GLOBAL_PROCESSED_SESSIONS = set(list(GLOBAL_PROCESSED_SESSIONS)[-500:])
+
+            if is_background:
+                logger.info(f"[BG] KQ {my_session_id}: {result}")
+                return
+
+        if is_background:
+            return
 
         with SESSION_LOCK:
             if token_id not in USER_SESSIONS:
@@ -359,38 +453,49 @@ def start_game_socket(token_id, game_token):
         add_log(token_id, f"🎲 KQ: {result} ({dices[0]}-{dices[1]}-{dices[2]})")
 
     try:
-        sio.connect('https://wtxmd52.tele68.com',
-                    socketio_path='txmd5/', namespaces=['/txmd5'],
-                    transports=['websocket'], auth={"token": game_token},
-                    headers={"User-Agent": "Mozilla/5.0"})
-        with SESSION_LOCK:
-            if token_id in USER_SESSIONS:
-                USER_SESSIONS[token_id]["sio"] = sio
+        sio.connect(
+            'https://wtxmd52.tele68.com',
+            socketio_path='txmd5/',
+            namespaces=['/txmd5'],
+            transports=['websocket'],
+            auth={"token": game_token},
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if not is_background:
+            with SESSION_LOCK:
+                if token_id in USER_SESSIONS:
+                    USER_SESSIONS[token_id]["sio"] = sio
         sio.wait()
     except Exception as e:
-        add_log(token_id, f"⚠️ Lỗi socket: {e}")
-        with SESSION_LOCK:
-            if token_id in USER_SESSIONS:
-                USER_SESSIONS[token_id]["game_connected"] = False
+        logger.error(f"Socket error ({token_id}): {e}")
+        if is_background:
+            with BG_LOCK:
+                BG_STATE["connected"] = False
+                BG_STATE["error"] = str(e)
+        else:
+            add_log(token_id, f"⚠️ Socket error: {e}")
+            with SESSION_LOCK:
+                if token_id in USER_SESSIONS:
+                    USER_SESSIONS[token_id]["game_connected"] = False
 
 
 # ==========================================
-# 🚀 FLASK API ENDPOINTS
+# 🚀 FLASK API
 # ==========================================
 @app.route('/api/login', methods=['POST'])
 def api_login():
     data = request.json or {}
     username = data.get('username', '').strip()
-    password_md5 = data.get('password', '')
+    password = data.get('password', '')  # PLAINTEXT — hash ở server
 
-    if not username or not password_md5:
-        return jsonify({"success": False, "message": "Thiếu thông tin đăng nhập"})
+    if not username or not password:
+        return jsonify({"success": False, "message": "Thiếu thông tin"})
 
-    result = do_login(username, password_md5)
+    result = do_login(username, password)
     if not result.get("success"):
         return jsonify({"success": False, "message": result.get("message", "Đăng nhập thất bại")})
 
-    # Xoá session cũ (nếu có)
+    # Xoá session cũ
     with SESSION_LOCK:
         old_token = USERNAME_TO_TOKEN.get(username)
         if old_token and old_token in USER_SESSIONS:
@@ -401,7 +506,6 @@ def api_login():
                 pass
             del USER_SESSIONS[old_token]
 
-    # Tạo session mới
     token_id = secrets.token_urlsafe(32)
     with SESSION_LOCK:
         USER_SESSIONS[token_id] = {
@@ -429,17 +533,18 @@ def api_login():
         }
         USERNAME_TO_TOKEN[username] = token_id
 
-    threading.Thread(target=start_game_socket, args=(token_id, result["game_token"]), daemon=True).start()
+    threading.Thread(target=start_game_socket,
+                     args=(token_id, result["game_token"], False),
+                     daemon=True).start()
 
     return jsonify({
         "success": True,
-        "errorCode": "0",
         "server_token": token_id,
-        "sessionKey": result["raw"].get("sessionKey"),
-        "curLevel": result["session_data"].get("curLevel", 1),
         "nickname": result["nickname"],
         "money": result["money"],
-        "session_data": result["session_data"]
+        "session_data": result["session_data"],     # 🔥 trả về luôn, không cần client decode
+        "curLevel": result["session_data"].get("curLevel", 1),
+        "debug_hash": result["pw_md5"],             # chứng minh hash real
     })
 
 
@@ -454,6 +559,17 @@ def api_state():
             [(k, round(v, 2)) for k, v in GLOBAL_AI_WEIGHTS.items()],
             key=lambda x: -x[1]
         )[:10]
+
+        with BG_LOCK:
+            bg_status = {
+                "running": BG_STATE["running"],
+                "connected": BG_STATE["connected"],
+                "nickname": BG_STATE["nickname"],
+                "session_id": BG_STATE["session_id"],
+                "last_seen": BG_STATE["last_seen"],
+                "login_count": BG_STATE["login_count"],
+                "error": BG_STATE["error"]
+            }
 
         return jsonify({
             "nickname": session["nickname"],
@@ -475,7 +591,8 @@ def api_state():
             "history_len": len(GLOBAL_HISTORY),
             "log": session["log"][-25:],
             "ai_weights": weights_sorted,
-            "session_data": session["session_data"]
+            "session_data": session["session_data"],
+            "bg_status": bg_status
         })
 
 
@@ -514,6 +631,42 @@ def api_settings():
     return jsonify({"ok": True})
 
 
+@app.route('/api/manual-bet', methods=['POST'])
+def api_manual_bet():
+    """Đặt cược thủ công 1 lần — bỏ qua auto_bet toggle."""
+    token_id = request.headers.get('X-Session-Token')
+    if not token_id or token_id not in USER_SESSIONS:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.json or {}
+    side = data.get("side", "").upper()
+    amount = int(data.get("amount", 0))
+
+    if side not in ["TAI", "XIU"] or amount < 1000:
+        return jsonify({"error": "invalid params"}), 400
+
+    with SESSION_LOCK:
+        if token_id not in USER_SESSIONS:
+            return jsonify({"error": "session expired"}), 401
+        session = USER_SESSIONS[token_id]
+        sio = session.get("sio")
+        if not sio or not session["game_connected"]:
+            return jsonify({"error": "socket chưa kết nối"}), 400
+        if session["has_bet_this_session"]:
+            return jsonify({"error": "đã cược phiên này rồi"}), 400
+
+        try:
+            sio.emit('bet', {"type": side, "amount": amount}, namespace='/txmd5')
+            session["has_bet_this_session"] = True
+            session["waiting_for_result"] = True
+            session["current_prediction"] = side
+            session["current_bet"] = amount
+            add_log(token_id, f"🎯 MANUAL BET: {amount:,} → {side}")
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/logout', methods=['POST'])
 def api_logout():
     token_id = request.headers.get('X-Session-Token')
@@ -533,20 +686,20 @@ def api_logout():
 
 
 # ==========================================
-# HTML TEMPLATE
+# HTML TEMPLATE VIP V4
 # ==========================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-<title>AUTO CƯỢC LC79 — HuyDaiXuVN</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="format-detection" content="telephone=no" />
+<title>AUTO CƯỢC LC79 VIP — HuyDaiXuVN</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"></script>
 <style>
   *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-  html,body{touch-action:manipulation;-webkit-text-size-adjust:100%;height:100%}
+  html,body{touch-action:manipulation;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;overscroll-behavior:none;height:100%}
   :root{
     --primary:#e63946;--primary-2:#ff4d6d;--primary-dark:#b5172a;--accent:#ffb703;--gold:#f4b400;
     --ink:#0d1117;--muted:#6b7280;--line:#e5e7eb;--bg:#f6f7fb;--success:#10b981;--danger:#ef4444;
@@ -565,12 +718,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .user-chip .avatar{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,var(--primary-2),var(--primary-dark));color:#fff;display:grid;place-items:center;font-size:11px;font-weight:700;text-transform:uppercase;flex-shrink:0}
   .btn-logout{padding:8px 14px;background:#fef2f2;color:var(--primary);border:1px solid #fecaca;border-radius:9px;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.2s}
   .btn-logout:hover{background:#fee2e2}
+
   .main{flex:1;display:grid;grid-template-columns:1fr 1fr;max-width:1180px;width:100%;margin:0 auto;padding:24px 20px;gap:32px;align-items:center}
-  .brand-panel{position:relative;min-height:520px;border-radius:22px;padding:40px 36px;color:#fff;background:radial-gradient(circle at 20% 10%,rgba(255,183,3,0.18) 0%,transparent 40%),radial-gradient(circle at 90% 90%,rgba(255,77,109,0.25) 0%,transparent 45%),linear-gradient(150deg,#1a1f2e 0%,#0d1117 60%,#1a0a10 100%);overflow:hidden;display:flex;flex-direction:column;justify-content:space-between;box-shadow:var(--shadow-lg);isolation:isolate}
+  .brand-panel{position:relative;min-height:560px;border-radius:22px;padding:40px 36px;color:#fff;background:radial-gradient(circle at 20% 10%,rgba(255,183,3,0.18) 0%,transparent 40%),radial-gradient(circle at 90% 90%,rgba(255,77,109,0.25) 0%,transparent 45%),linear-gradient(150deg,#1a1f2e 0%,#0d1117 60%,#1a0a10 100%);overflow:hidden;display:flex;flex-direction:column;justify-content:space-between;box-shadow:var(--shadow-lg);isolation:isolate}
   .brand-panel::before{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,0.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.035) 1px,transparent 1px);background-size:40px 40px;mask-image:radial-gradient(ellipse at 50% 0%,#000 30%,transparent 75%)}
   .brand-panel > *{position:relative;z-index:1}
   .badge-new{display:inline-flex;align-items:center;gap:7px;padding:5px 11px 5px 7px;border-radius:999px;font-size:11px;font-weight:600;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);width:fit-content}
-  .badge-new .dot{width:6px;height:6px;border-radius:50%;background:var(--success);box-shadow:0 0 0 3px rgba(16,185,129,0.25)}
+  .badge-new .dot{width:6px;height:6px;border-radius:50%;background:var(--success);box-shadow:0 0 0 3px rgba(16,185,129,0.25);animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(0.85)}}
   .brand-panel h1{font-family:'Space Grotesk',sans-serif;font-size:clamp(24px,3vw,36px);line-height:1.18;font-weight:700;letter-spacing:-0.7px;margin:18px 0 12px;max-width:440px}
   .brand-panel h1 .grad{background:linear-gradient(120deg,#ff4d6d 0%,#ffb703 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
   .brand-panel p.lead{font-size:14.5px;line-height:1.7;color:rgba(255,255,255,0.65);max-width:400px}
@@ -579,6 +734,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .feature-icon{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,rgba(255,77,109,0.25),rgba(255,183,3,0.2));display:grid;place-items:center;flex-shrink:0;color:#ffb703}
   .feature-item strong{display:block;font-size:13px;font-weight:600;color:#fff;margin-bottom:1px}
   .feature-item small{font-size:11.5px;color:rgba(255,255,255,0.5)}
+
   .login-panel{display:flex;justify-content:center;align-items:center}
   .login-card{width:100%;max-width:420px;background:#fff;border-radius:18px;padding:36px 30px 32px;border:1px solid var(--line);box-shadow:var(--shadow-md)}
   .login-card h2{font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:700;color:var(--ink);margin-bottom:5px}
@@ -614,16 +770,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .welcome-avatar{width:62px;height:62px;border-radius:16px;background:rgba(255,255,255,0.22);display:grid;place-items:center;font-size:24px;font-weight:800;font-family:'Space Grotesk',sans-serif;border:2px solid rgba(255,255,255,0.3);flex-shrink:0;position:relative;z-index:1;text-transform:uppercase}
   .welcome-info{position:relative;z-index:1;min-width:0;flex:1}
   .welcome-info .greet{font-size:12px;opacity:0.85;margin-bottom:1px;font-weight:500}
-  .welcome-info h2{font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .welcome-info h2{font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .level-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;background:linear-gradient(135deg,#ffb703,#ff8c00);border-radius:999px;font-size:11px;font-weight:700;color:#1a1f2e;text-transform:uppercase;letter-spacing:0.5px;margin-right:6px}
   .connection-status{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:600}
   .connection-status.connected{background:rgba(16,185,129,0.2);color:#a7f3d0}
   .connection-status.disconnected{background:rgba(239,68,68,0.2);color:#fecaca}
   .connection-status .dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 1.5s infinite}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
 
   .stats-grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
-  .stat-card{background:#fff;border-radius:16px;padding:18px 18px 16px;border:1px solid var(--line);box-shadow:var(--shadow-md);border-left:4px solid var(--primary);position:relative}
+  .stat-card{background:#fff;border-radius:16px;padding:18px 18px 16px;border:1px solid var(--line);box-shadow:var(--shadow-md);border-left:4px solid var(--primary);position:relative;transition:transform 0.2s}
   .stat-card.win{border-left-color:var(--success)}
   .stat-card.loss{border-left-color:var(--danger)}
   .stat-card.gold{border-left-color:var(--gold)}
@@ -633,50 +788,77 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .stat-value.loss{color:var(--danger)}
   .stat-unit{font-size:11px;font-weight:600;color:var(--muted);margin-left:2px}
 
-  .prediction-panel{background:linear-gradient(135deg,#1a1f2e 0%,#2d1b2e 100%);color:#fff;border-radius:18px;padding:24px;position:relative;overflow:hidden}
+  .prediction-panel{background:linear-gradient(135deg,#1a1f2e 0%,#2d1b2e 100%);color:#fff;border-radius:18px;padding:26px;position:relative;overflow:hidden}
   .prediction-panel::after{content:'';position:absolute;width:280px;height:280px;border-radius:50%;background:radial-gradient(circle,rgba(255,183,3,0.15),transparent 70%);top:-100px;right:-100px}
   .pred-session{font-size:12px;opacity:0.7;margin-bottom:8px;font-family:'Space Grotesk',sans-serif;letter-spacing:0.5px;position:relative;z-index:1}
-  .pred-value{font-size:48px;font-weight:800;font-family:'Space Grotesk',sans-serif;letter-spacing:-1.5px;position:relative;z-index:1}
-  .pred-value.tai{color:#4dabf7;text-shadow:0 0 24px rgba(77,171,247,0.55)}
-  .pred-value.xiu{color:#ff6b6b;text-shadow:0 0 24px rgba(255,107,107,0.55)}
+  .pred-value{font-size:48px;font-weight:800;font-family:'Space Grotesk',sans-serif;letter-spacing:-1.5px;position:relative;z-index:1;transition:all 0.5s ease;line-height:1.1}
+  .pred-value.tai{color:#4dabf7;text-shadow:0 0 24px rgba(77,171,247,0.55),0 0 48px rgba(77,171,247,0.25);animation:glowTai 2s infinite alternate}
+  .pred-value.xiu{color:#ff6b6b;text-shadow:0 0 24px rgba(255,107,107,0.55),0 0 48px rgba(255,107,107,0.25);animation:glowXiu 2s infinite alternate}
   .pred-value.unknown{color:#9ca3af;font-size:22px;letter-spacing:0}
+  @keyframes glowTai{from{filter:brightness(1)}to{filter:brightness(1.25)}}
+  @keyframes glowXiu{from{filter:brightness(1)}to{filter:brightness(1.25)}}
   .pred-result-line{margin-top:10px;font-size:13px;opacity:0.75;position:relative;z-index:1}
-  .pred-result-line b{font-weight:700}
-  .history-strip{display:flex;flex-wrap:wrap;gap:6px;margin-top:16px;position:relative;z-index:1;max-height:100px;overflow-y:auto}
-  .history-chip{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;font-size:13px;font-weight:800;font-family:'Space Grotesk',sans-serif;flex-shrink:0}
+  .pred-result-line b{font-weight:700;color:#ffb703}
+  .history-strip{display:flex;flex-wrap:wrap;gap:6px;margin-top:16px;position:relative;z-index:1;max-height:110px;overflow-y:auto;padding:2px}
+  .history-chip{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;font-size:13px;font-weight:800;font-family:'Space Grotesk',sans-serif;flex-shrink:0;animation:popIn 0.3s ease}
   .history-chip.tai{background:rgba(77,171,247,0.2);color:#4dabf7;border:1px solid rgba(77,171,247,0.4)}
   .history-chip.xiu{background:rgba(255,107,107,0.2);color:#ff6b6b;border:1px solid rgba(255,107,107,0.4)}
+  @keyframes popIn{from{transform:scale(0);opacity:0}to{transform:scale(1);opacity:1}}
 
   .card{background:#fff;border-radius:16px;padding:22px;border:1px solid var(--line);box-shadow:var(--shadow-md)}
-  .card h3{font-family:'Space Grotesk',sans-serif;font-size:15px;font-weight:700;color:var(--ink);margin-bottom:16px;display:flex;align-items:center;gap:8px}
+  .card h3{font-family:'Space Grotesk',sans-serif;font-size:15px;font-weight:700;color:var(--ink);margin-bottom:16px;display:flex;align-items:center;gap:8px;justify-content:space-between}
+  .card h3 .left{display:flex;align-items:center;gap:8px}
 
-  .setting-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 0;border-bottom:1px solid #f0f2f5}
+  .bg-status{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:600;background:#f0f2f5;color:var(--muted)}
+  .bg-status.on{background:#ecfdf5;color:#047857}
+  .bg-status .dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 1.5s infinite}
+
+  .setting-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 0;border-bottom:1px solid #f0f2f5;flex-wrap:wrap}
   .setting-row:last-child{border-bottom:none}
-  .setting-row .info{flex:1;min-width:0}
-  .setting-row label{font-size:14px;font-weight:600;color:var(--ink);display:block;cursor:pointer}
+  .setting-row .info{flex:1;min-width:200px}
+  .setting-row label{font-size:14px;font-weight:600;color:var(--ink);display:block}
   .setting-row small{display:block;font-size:11.5px;color:var(--muted);font-weight:400;margin-top:3px;line-height:1.4}
-  .setting-input{width:140px;padding:9px 12px;border:1.5px solid var(--line);border-radius:8px;font-size:14px;font-weight:600;text-align:right;font-family:'Space Grotesk',sans-serif;transition:border 0.15s}
+  .setting-input{width:150px;padding:10px 12px;border:1.5px solid var(--line);border-radius:8px;font-size:14px;font-weight:600;text-align:right;font-family:'Space Grotesk',sans-serif;transition:border 0.15s}
   .setting-input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(230,57,70,0.08)}
-  .toggle-switch{position:relative;width:48px;height:26px;background:#e5e7eb;border-radius:999px;cursor:pointer;transition:background 0.2s;border:none;padding:0;flex-shrink:0}
-  .toggle-switch::after{content:'';position:absolute;top:3px;left:3px;width:20px;height:20px;background:#fff;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,0.2);transition:transform 0.2s}
-  .toggle-switch.on{background:linear-gradient(135deg,var(--primary-2),var(--primary-dark))}
-  .toggle-switch.on::after{transform:translateX(22px)}
+
+  /* Toggle switch — FIX: pointer-events + z-index */
+  .toggle-switch{position:relative;width:52px;height:28px;background:#e5e7eb;border-radius:999px;cursor:pointer;transition:background 0.25s;border:none;padding:0;flex-shrink:0;pointer-events:auto;z-index:1;outline:none}
+  .toggle-switch::after{content:'';position:absolute;top:3px;left:3px;width:22px;height:22px;background:#fff;border-radius:50%;box-shadow:0 2px 4px rgba(0,0,0,0.2);transition:transform 0.25s cubic-bezier(0.4,0,0.2,1)}
+  .toggle-switch.on{background:linear-gradient(135deg,var(--primary-2),var(--primary-dark));box-shadow:0 0 0 3px rgba(230,57,70,0.15)}
+  .toggle-switch.on::after{transform:translateX(24px)}
+  .toggle-switch:active::after{width:26px}
+  .toggle-switch.on:active::after{transform:translateX(20px)}
 
   .weights-list{display:grid;gap:6px}
   .weight-row{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:8px;background:#f8f9fb;font-size:13px}
   .weight-name{flex:0 0 130px;color:var(--ink);font-weight:600;font-family:'Space Grotesk',sans-serif;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .weight-bar{flex:1;height:6px;background:#e5e7eb;border-radius:999px;overflow:hidden;min-width:40px}
-  .weight-bar-fill{height:100%;background:linear-gradient(90deg,var(--primary-2),var(--accent));border-radius:999px;transition:width 0.4s}
+  .weight-bar-fill{height:100%;background:linear-gradient(90deg,var(--primary-2),var(--accent));border-radius:999px;transition:width 0.4s ease}
   .weight-value{font-size:12px;color:var(--primary);font-weight:700;min-width:42px;text-align:right;font-family:'Space Grotesk',sans-serif}
 
   .log-list{display:grid;gap:4px;max-height:340px;overflow-y:auto;font-family:'Consolas','Monaco',monospace;font-size:12px}
-  .log-item{padding:7px 10px;border-radius:6px;background:#f8f9fb;display:flex;gap:10px;border-left:2px solid #e5e7eb}
+  .log-item{padding:7px 10px;border-radius:6px;background:#f8f9fb;display:flex;gap:10px;border-left:2px solid #e5e7eb;animation:slideIn 0.25s ease}
   .log-item.win{background:#ecfdf5;border-left-color:var(--success)}
   .log-item.loss{background:#fef2f2;border-left-color:var(--danger)}
+  .log-item.bet{background:#eff6ff;border-left-color:#3b82f6}
   .log-time{color:var(--muted);flex-shrink:0;font-weight:600}
   .log-msg{color:#1f2937;word-break:break-word}
+  @keyframes slideIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
 
-  .x2-badge{display:inline-block;padding:2px 7px;border-radius:5px;background:linear-gradient(135deg,#ffb703,#ff8c00);color:#1a1f2e;font-size:10px;font-weight:800;margin-left:6px;letter-spacing:0.5px}
+  .x2-badge{display:inline-block;padding:2px 7px;border-radius:5px;background:linear-gradient(135deg,#ffb703,#ff8c00);color:#1a1f2e;font-size:10px;font-weight:800;margin-left:6px;letter-spacing:0.5px;animation:pulse 1s infinite}
+
+  .manual-bet-bar{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+  .manual-btn{flex:1;min-width:100px;padding:11px 14px;border:none;border-radius:10px;font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;transition:all 0.2s;display:flex;align-items:center;justify-content:center;gap:6px}
+  .manual-btn.tai{background:linear-gradient(135deg,#4dabf7,#1e88e5);color:#fff;box-shadow:0 4px 12px rgba(30,136,229,0.3)}
+  .manual-btn.xiu{background:linear-gradient(135deg,#ff6b6b,#e63946);color:#fff;box-shadow:0 4px 12px rgba(230,57,70,0.3)}
+  .manual-btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 6px 16px rgba(0,0,0,0.2)}
+  .manual-btn:disabled{opacity:0.5;cursor:not-allowed}
+
+  .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);padding:12px 20px;border-radius:10px;color:#fff;font-size:13px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.2);z-index:999;transition:transform 0.3s ease;max-width:90%}
+  .toast.show{transform:translateX(-50%) translateY(0)}
+  .toast.success{background:linear-gradient(135deg,#10b981,#059669)}
+  .toast.error{background:linear-gradient(135deg,#ef4444,#dc2626)}
+  .toast.info{background:linear-gradient(135deg,#3b82f6,#2563eb)}
 
   .footer{background:#fff;border-top:1px solid var(--line);padding:18px 20px;margin-top:auto}
   .footer-inner{max-width:1280px;margin:0 auto;text-align:center}
@@ -688,7 +870,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .brand-panel{min-height:auto;padding:28px 24px;border-radius:16px}
     .feature-list{display:none}
     .brand-panel h1{font-size:22px;margin:14px 0 10px}
-    .brand-panel p.lead{font-size:13.5px}
     .stats-grid-4{grid-template-columns:repeat(2,1fr)}
     .pred-value{font-size:36px}
   }
@@ -702,13 +883,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   @media (max-width:480px){
     .header-inner{padding:10px 14px}
     .user-chip span{display:none}
-    .brand-name small{font-size:9px}
     .dash{padding:14px;gap:12px}
     .stat-card{padding:14px 16px}
     .stat-value{font-size:20px}
     .stats-grid-4{grid-template-columns:1fr}
     .pred-value{font-size:32px}
-    .setting-row{flex-wrap:wrap}
+    .setting-row{flex-direction:column;align-items:flex-start}
     .setting-input{width:100%}
     .weight-name{flex:0 0 90px}
   }
@@ -722,28 +902,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="header-inner">
       <a href="#" class="brand">
         <div class="brand-mark">LC79</div>
-        <div class="brand-name"><strong>AUTO CƯỢC LC79</strong><small>Automation System</small></div>
+        <div class="brand-name"><strong>AUTO CƯỢC LC79 VIP</strong><small>35 AI Cores • Real Bet</small></div>
       </a>
     </div>
   </header>
   <main class="main">
     <section class="brand-panel">
       <div>
-        <div class="badge-new"><span class="dot"></span>Hệ thống AI 35 lõi đang hoạt động</div>
+        <div class="badge-new"><span class="dot"></span>Background AI đang thu thập dữ liệu 24/7</div>
         <h1>Đăng nhập để bước vào<br><span class="grad">kỷ nguyên tự động hóa</span></h1>
-        <p class="lead">Dự đoán Tài Xỉu bằng 35 lõi AI thích ứng — tự động vào tiền, nhân đôi khi thắng, chốt lãi thông minh, quản lý vốn chuyên nghiệp.</p>
+        <p class="lead">Dự đoán Tài Xỉu bằng 35 lõi AI thích ứng — tự động vào tiền REAL, nhân đôi khi thắng, chốt lãi thông minh, quản lý vốn chuyên nghiệp.</p>
         <div class="feature-list">
           <div class="feature-item">
             <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
-            <div><strong>Bảo mật MD5</strong><small>Mật khẩu mã hóa 1 chiều</small></div>
+            <div><strong>Hash MD5 Server-Side</strong><small>Bảo mật như bot chuẩn</small></div>
           </div>
           <div class="feature-item">
             <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
-            <div><strong>35 lõi AI thích ứng</strong><small>Exponential Weighting</small></div>
+            <div><strong>35 lõi AI + Exponential Weighting</strong><small>Tự học, tự thích ứng</small></div>
           </div>
           <div class="feature-item">
             <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div>
-            <div><strong>Auto Cược + X2</strong><small>Tự động hóa toàn bộ</small></div>
+            <div><strong>Auto Cược + X2 + Chốt lãi</strong><small>REAL betting qua WSS</small></div>
           </div>
         </div>
       </div>
@@ -793,7 +973,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="header-inner">
       <a href="#" class="brand">
         <div class="brand-mark">LC79</div>
-        <div class="brand-name"><strong>AUTO CƯỢC LC79</strong><small>Dashboard</small></div>
+        <div class="brand-name"><strong>AUTO CƯỢC LC79 VIP</strong><small>Dashboard</small></div>
       </a>
       <div class="header-right">
         <div class="user-chip"><div class="avatar" id="userAvatar">U</div><span id="userChipName">User</span></div>
@@ -844,7 +1024,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h3>⚙️ Cài đặt Auto Cược</h3>
+      <h3>
+        <span class="left">⚙️ Cài đặt Auto Cược</span>
+        <span class="bg-status" id="bgStatus"><span class="dot"></span><span id="bgStatusText">Background: đang tải...</span></span>
+      </h3>
       <div class="setting-row">
         <div class="info">
           <label for="baseBet">Số tiền auto cược mỗi phiên</label>
@@ -854,17 +1037,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <div class="setting-row">
         <div class="info">
-          <label>Bật/Tắt Auto Cược</label>
-          <small>Bot tự động đặt cược theo tín hiệu AI</small>
+          <label>Bật/Tắt Auto Cược (REAL)</label>
+          <small>Bot tự đặt cược thật qua WSS khi có tín hiệu AI</small>
         </div>
-        <button class="toggle-switch" id="autoBetToggle" aria-label="Auto Bet"></button>
+        <button type="button" class="toggle-switch" id="autoBetToggle" aria-label="Auto Bet"></button>
       </div>
       <div class="setting-row">
         <div class="info">
-          <label>X2 (Nhân đôi số tiền khi thắng)</label>
-          <small>Thắng 1k → cược 2k. Thắng tiếp vẫn 2k (không x4). Thua → quay về 1k.</small>
+          <label>X2 — Nhân đôi khi thắng</label>
+          <small>Thắng 1k → cược 2k. Thắng tiếp vẫn 2k (không x4). Thua → reset về 1k.</small>
         </div>
-        <button class="toggle-switch" id="x2Toggle" aria-label="X2 Mode"></button>
+        <button type="button" class="toggle-switch" id="x2Toggle" aria-label="X2 Mode"></button>
       </div>
       <div class="setting-row">
         <div class="info">
@@ -873,68 +1056,130 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <input type="number" class="setting-input" id="targetProfit" value="0" min="0" step="10000" />
       </div>
+      <div class="setting-row" style="display:block">
+        <div class="info" style="width:100%;margin-bottom:8px">
+          <label>🎯 Đặt cược thủ công (1 lần)</label>
+          <small>Bỏ qua Auto — chỉ đặt khi bạn muốn</small>
+        </div>
+        <div class="manual-bet-bar">
+          <button type="button" class="manual-btn tai" id="btnManualTai">🔵 ĐẶT TÀI</button>
+          <button type="button" class="manual-btn xiu" id="btnManualXiu">🔴 ĐẶT XỈU</button>
+        </div>
+      </div>
     </div>
 
     <div class="card">
-      <h3>🧠 TOP 10 Lõi AI dẫn đầu</h3>
+      <h3><span class="left">🧠 TOP 10 Lõi AI dẫn đầu</span></h3>
       <div class="weights-list" id="weightsList"><div style="color:var(--muted);font-size:13px;text-align:center;padding:20px">Đang tải...</div></div>
     </div>
 
     <div class="card">
-      <h3>📋 Nhật ký hoạt động</h3>
+      <h3><span class="left">📋 Nhật ký hoạt động</span></h3>
       <div class="log-list" id="logList"><div style="color:var(--muted);font-size:13px;text-align:center;padding:20px">Chưa có hoạt động</div></div>
     </div>
   </main>
   <footer class="footer"><div class="footer-inner"><div class="copyright">© 2025 AUTO CƯỢC LC79 — Bản quyền thuộc về <b>HuyDaiXuVN</b></div></div></footer>
 </div>
 
+<div class="toast" id="toast"></div>
+
 <script>
 const $ = id => document.getElementById(id);
 let SERVER_TOKEN = null;
 let POLL_TIMER = null;
-let LAST_LOG_LEN = 0;
+const PENDING = {};  // Pending settings — tránh race condition
 
+/* ============================================================
+   🔒 CHỐNG ZOOM TRIỆT ĐỂ
+   ============================================================ */
+let lastTouch = 0;
+document.addEventListener('touchend', (e) => {
+  const now = Date.now();
+  if (now - lastTouch <= 300) e.preventDefault();
+  lastTouch = now;
+}, { passive: false });
+
+document.addEventListener('touchmove', (e) => {
+  if (e.touches.length > 1) e.preventDefault();
+}, { passive: false });
+
+['gesturestart','gesturechange','gestureend'].forEach(ev => {
+  document.addEventListener(ev, e => e.preventDefault(), { passive: false });
+});
+
+document.addEventListener('wheel', (e) => {
+  if (e.ctrlKey) e.preventDefault();
+}, { passive: false });
+
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && ['+','-','=','0'].includes(e.key)) {
+    e.preventDefault();
+  }
+});
+
+// Prevent double-click zoom on elements
+document.addEventListener('dblclick', (e) => e.preventDefault(), { passive: false });
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
 function fmt(v){
   if(v===null||v===undefined||v==='') return '0';
   const n = Number(v);
   if(isNaN(n)) return String(v);
   return new Intl.NumberFormat('vi-VN').format(n);
 }
+function escapeHtml(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
 function showError(msg){ $('alertText').textContent = msg; $('alertBox').classList.add('show'); }
 function hideError(){ $('alertBox').classList.remove('show'); }
+function toast(msg, type='info'){
+  const t = $('toast');
+  t.className = 'toast show ' + type;
+  t.textContent = msg;
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(()=>{ t.classList.remove('show'); }, 2500);
+}
+function setPending(key, ms=2000){
+  PENDING[key] = Date.now() + ms;
+}
+function isPending(key){
+  return PENDING[key] && Date.now() < PENDING[key];
+}
 
-// Chống zoom
-let lastTouch=0;
-document.addEventListener('touchend',e=>{const now=Date.now();if(now-lastTouch<=300)e.preventDefault();lastTouch=now;},{passive:false});
-document.addEventListener('touchmove',e=>{if(e.touches.length>1)e.preventDefault();},{passive:false});
-
-// Ẩn/hiện mật khẩu
-const eyeOpen=`<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>`;
-const eyeClosed=`<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>`;
-$('togglePass').addEventListener('click',()=>{
-  const pw=$('password'); const show=pw.type==='password';
-  pw.type=show?'text':'password';
-  $('eyeIcon').innerHTML=show?eyeClosed:eyeOpen;
+/* ============================================================
+   TOGGLE MẬT KHẨU
+   ============================================================ */
+const eyeOpen = `<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>`;
+const eyeClosed = `<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>`;
+$('togglePass').addEventListener('click', ()=>{
+  const pw = $('password');
+  const show = pw.type === 'password';
+  pw.type = show ? 'text' : 'password';
+  $('eyeIcon').innerHTML = show ? eyeClosed : eyeOpen;
 });
 
+/* ============================================================
+   LOGIN
+   ============================================================ */
 const savedUser = localStorage.getItem('lc79_user');
 if(savedUser){ $('username').value = savedUser; $('remember').checked = true; }
 
-// LOGIN
 $('loginForm').addEventListener('submit', async (e)=>{
   e.preventDefault(); hideError();
   const username = $('username').value.trim();
-  const password = $('password').value;
-  if(!username||!password){ showError('Vui lòng nhập đầy đủ thông tin'); return; }
+  const password = $('password').value;  // Gửi PLAINTEXT — server hash
+  if(!username || !password){ showError('Vui lòng nhập đầy đủ thông tin'); return; }
 
   const btn = $('btnLogin');
   btn.classList.add('loading'); btn.disabled = true;
 
   try {
-    const res = await fetch('/api/login',{
+    const res = await fetch('/api/login', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({ username, password: CryptoJS.MD5(password).toString() })
+      body:JSON.stringify({ username, password })
     });
     const data = await res.json();
 
@@ -942,15 +1187,14 @@ $('loginForm').addEventListener('submit', async (e)=>{
       SERVER_TOKEN = data.server_token;
       if($('remember').checked) localStorage.setItem('lc79_user', username);
       else localStorage.removeItem('lc79_user');
-
       localStorage.setItem('lc79_server_token', SERVER_TOKEN);
       showDashboard(data);
       startPolling();
+      toast('Đăng nhập thành công!', 'success');
     } else {
       showError(data.message || 'Đăng nhập thất bại');
     }
   } catch(err){
-    console.error(err);
     showError('Không thể kết nối server');
   } finally {
     btn.classList.remove('loading'); btn.disabled = false;
@@ -969,15 +1213,15 @@ function showDashboard(loginData){
   $('userChipName').textContent = nick;
   $('welcomeAvatar').textContent = initial;
   $('welcomeName').textContent = nick;
-  $('levelBadge').textContent = `★ LV.${loginData.curLevel || 1}`;
+  $('levelBadge').textContent = `★ LV.${loginData.curLevel || sd.curLevel || 1}`;
   $('balanceValue').textContent = fmt(loginData.money);
 }
 
-// LOGOUT
+/* ============================================================
+   LOGOUT
+   ============================================================ */
 $('btnLogout').addEventListener('click', async ()=>{
-  try {
-    await fetch('/api/logout',{method:'POST',headers:{'X-Session-Token':SERVER_TOKEN}});
-  } catch(e){}
+  try { await fetch('/api/logout',{method:'POST',headers:{'X-Session-Token':SERVER_TOKEN}}); } catch(e){}
   stopPolling();
   localStorage.removeItem('lc79_server_token');
   SERVER_TOKEN = null;
@@ -987,13 +1231,15 @@ $('btnLogout').addEventListener('click', async ()=>{
   hideError();
 });
 
-// RESTORE SESSION
+/* ============================================================
+   RESTORE SESSION
+   ============================================================ */
 (function restore(){
   const saved = localStorage.getItem('lc79_server_token');
   if(!saved) return;
   SERVER_TOKEN = saved;
   fetch('/api/state',{headers:{'X-Session-Token':saved}})
-    .then(r=>r.ok?r.json():null)
+    .then(r=>r.ok ? r.json() : null)
     .then(state=>{
       if(state){
         const sd = state.session_data || {};
@@ -1004,10 +1250,12 @@ $('btnLogout').addEventListener('click', async ()=>{
         SERVER_TOKEN = null;
       }
     })
-    .catch(()=>{ localStorage.removeItem('lc79_server_token'); SERVER_TOKEN=null; });
+    .catch(()=>{ localStorage.removeItem('lc79_server_token'); SERVER_TOKEN = null; });
 })();
 
-// ===================== POLLING =====================
+/* ============================================================
+   POLLING
+   ============================================================ */
 function startPolling(){
   if(POLL_TIMER) return;
   pollState();
@@ -1023,12 +1271,11 @@ async function pollState(){
     const res = await fetch('/api/state',{headers:{'X-Session-Token':SERVER_TOKEN}});
     if(!res.ok){
       if(res.status === 401){
-        // Session hết hạn
         stopPolling();
         localStorage.removeItem('lc79_server_token');
         SERVER_TOKEN = null;
-        $('dashboardView').style.display='none';
-        $('loginView').style.display='block';
+        $('dashboardView').style.display = 'none';
+        $('loginView').style.display = 'block';
       }
       return;
     }
@@ -1038,19 +1285,14 @@ async function pollState(){
 }
 
 function updateDashboard(s){
-  // Balance
   $('balanceValue').textContent = fmt(s.balance);
 
-  // P/L
   const plEl = $('plValue');
   plEl.textContent = (s.profit_loss >= 0 ? '+' : '') + fmt(s.profit_loss);
   plEl.className = 'stat-value ' + (s.profit_loss >= 0 ? 'win' : 'loss');
   $('plCard').className = 'stat-card ' + (s.profit_loss >= 0 ? 'win' : 'loss');
 
-  // Streak
   $('streakValue').textContent = s.win_streak;
-
-  // Current bet
   $('betValue').textContent = fmt(s.current_bet);
   $('x2Badge').style.display = (s.x2_mode && s.win_streak >= 1) ? 'inline-block' : 'none';
 
@@ -1064,7 +1306,22 @@ function updateDashboard(s){
     $('connText').textContent = 'Đang kết nối...';
   }
 
-  // Session ID
+  // Background status
+  if(s.bg_status){
+    const bs = $('bgStatus');
+    const bt = $('bgStatusText');
+    if(s.bg_status.connected){
+      bs.className = 'bg-status on';
+      bt.textContent = `BG: ${s.bg_status.nickname || 'OK'} • ${s.history_len} phiên`;
+    } else if(s.bg_status.running){
+      bs.className = 'bg-status';
+      bt.textContent = `BG: đang kết nối lại...`;
+    } else {
+      bs.className = 'bg-status';
+      bt.textContent = `BG: offline`;
+    }
+  }
+
   $('sessionId').textContent = s.session_id || '—';
 
   // Prediction
@@ -1080,14 +1337,13 @@ function updateDashboard(s){
     pv.className = 'pred-value unknown';
   }
 
-  // Latest result
   if(s.current_result && s.dices){
     $('lastResult').textContent = `${s.current_result} (${s.dices.join('-')})`;
   } else {
     $('lastResult').textContent = '—';
   }
 
-  // History strip
+  // History
   const strip = $('historyStrip');
   strip.innerHTML = (s.history || []).slice().reverse().map(r=>{
     const cls = r === 'TAI' ? 'tai' : 'xiu';
@@ -1095,18 +1351,21 @@ function updateDashboard(s){
     return `<div class="history-chip ${cls}">${label}</div>`;
   }).join('');
 
-  // Settings (chỉ update nếu chưa focus)
-  if(document.activeElement !== $('baseBet')){
-    if(!$('baseBet').value || $('baseBet').value === '10000' || document.activeElement !== $('baseBet'))
-      $('baseBet').value = s.base_bet;
+  // Settings — FIX: bỏ qua nếu đang pending
+  if(!isPending('base_bet') && document.activeElement !== $('baseBet')){
+    $('baseBet').value = s.base_bet;
   }
-  if(document.activeElement !== $('targetProfit')){
+  if(!isPending('target_profit') && document.activeElement !== $('targetProfit')){
     $('targetProfit').value = s.target_profit || 0;
   }
-  $('autoBetToggle').classList.toggle('on', s.auto_bet);
-  $('x2Toggle').classList.toggle('on', s.x2_mode);
+  if(!isPending('auto_bet')){
+    $('autoBetToggle').classList.toggle('on', s.auto_bet);
+  }
+  if(!isPending('x2_mode')){
+    $('x2Toggle').classList.toggle('on', s.x2_mode);
+  }
 
-  // AI weights
+  // Weights
   const wl = $('weightsList');
   if(s.ai_weights && s.ai_weights.length){
     const maxW = s.ai_weights[0][1] || 1;
@@ -1120,13 +1379,14 @@ function updateDashboard(s){
     }).join('');
   }
 
-  // Log
+  // Logs
   const logList = $('logList');
   if(s.log && s.log.length){
     logList.innerHTML = s.log.slice().reverse().map(l=>{
       let cls = 'log-item';
       if(l.msg.includes('THẮNG') || l.msg.includes('ĐẠT TARGET')) cls += ' win';
       else if(l.msg.includes('THUA')) cls += ' loss';
+      else if(l.msg.includes('BET') || l.msg.includes('Đặt cược')) cls += ' bet';
       return `<div class="${cls}"><span class="log-time">${l.time}</span><span class="log-msg">${escapeHtml(l.msg)}</span></div>`;
     }).join('');
   } else {
@@ -1134,11 +1394,9 @@ function updateDashboard(s){
   }
 }
 
-function escapeHtml(s){
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-// ===================== SETTINGS =====================
+/* ============================================================
+   SETTINGS API
+   ============================================================ */
 async function updateSetting(patch){
   if(!SERVER_TOKEN) return;
   try {
@@ -1147,37 +1405,84 @@ async function updateSetting(patch){
       headers:{'Content-Type':'application/json','X-Session-Token':SERVER_TOKEN},
       body:JSON.stringify(patch)
     });
-    pollState();
   } catch(e){ console.error(e); }
 }
 
-$('autoBetToggle').addEventListener('click',()=>{
-  const isOn = $('autoBetToggle').classList.contains('on');
-  updateSetting({ auto_bet: !isOn });
+/* ============================================================
+   TOGGLE BUTTONS — FIX CHUẨN (optimistic + pending)
+   ============================================================ */
+$('autoBetToggle').addEventListener('click', (e)=>{
+  e.preventDefault();
+  e.stopPropagation();
+  const wasOn = $('autoBetToggle').classList.contains('on');
+  // Optimistic update
+  $('autoBetToggle').classList.toggle('on', !wasOn);
+  setPending('auto_bet', 2500);
+  updateSetting({ auto_bet: !wasOn });
+  toast(wasOn ? '🔴 Đã tắt Auto Cược' : '🟢 Đã bật Auto Cược (REAL)', wasOn ? 'info' : 'success');
 });
 
-$('x2Toggle').addEventListener('click',()=>{
-  const isOn = $('x2Toggle').classList.contains('on');
-  updateSetting({ x2_mode: !isOn });
+$('x2Toggle').addEventListener('click', (e)=>{
+  e.preventDefault();
+  e.stopPropagation();
+  const wasOn = $('x2Toggle').classList.contains('on');
+  $('x2Toggle').classList.toggle('on', !wasOn);
+  setPending('x2_mode', 2500);
+  updateSetting({ x2_mode: !wasOn });
+  toast(wasOn ? '🔴 Đã tắt X2' : '🔥 Đã bật X2', wasOn ? 'info' : 'success');
 });
 
+/* ============================================================
+   INPUT DEBOUNCE
+   ============================================================ */
 let baseBetTimer = null;
-$('baseBet').addEventListener('input',()=>{
+$('baseBet').addEventListener('input', ()=>{
   clearTimeout(baseBetTimer);
+  setPending('base_bet', 3000);
   baseBetTimer = setTimeout(()=>{
     const v = Math.max(1000, parseInt($('baseBet').value)||10000);
     updateSetting({ base_bet: v });
-  }, 600);
+  }, 700);
 });
 
 let targetTimer = null;
-$('targetProfit').addEventListener('input',()=>{
+$('targetProfit').addEventListener('input', ()=>{
   clearTimeout(targetTimer);
+  setPending('target_profit', 3000);
   targetTimer = setTimeout(()=>{
     const v = Math.max(0, parseInt($('targetProfit').value)||0);
     updateSetting({ target_profit: v });
-  }, 600);
+  }, 700);
 });
+
+/* ============================================================
+   MANUAL BET
+   ============================================================ */
+async function manualBet(side){
+  if(!SERVER_TOKEN){ toast('Chưa đăng nhập', 'error'); return; }
+  const amt = Math.max(1000, parseInt($('baseBet').value)||10000);
+  if(!confirm(`Đặt ${side} ${fmt(amt)} VIN phiên này?`)) return;
+
+  try {
+    const res = await fetch('/api/manual-bet', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Session-Token':SERVER_TOKEN},
+      body:JSON.stringify({ side, amount: amt })
+    });
+    const data = await res.json();
+    if(data.ok){
+      toast(`🎯 Đã đặt ${side} ${fmt(amt)} VIN`, 'success');
+    } else {
+      toast(data.error || 'Lỗi đặt cược', 'error');
+    }
+  } catch(e){
+    toast('Lỗi kết nối', 'error');
+  }
+  pollState();
+}
+
+$('btnManualTai').addEventListener('click', ()=> manualBet('TAI'));
+$('btnManualXiu').addEventListener('click', ()=> manualBet('XIU'));
 </script>
 </body>
 </html>
@@ -1189,9 +1494,25 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
+# ==========================================
+# STARTUP — Auto start Background Collector
+# ==========================================
+def start_bg_thread():
+    global BG_THREAD_STARTED
+    if BG_THREAD_STARTED:
+        return
+    BG_THREAD_STARTED = True
+    t = threading.Thread(target=background_data_collector, daemon=True)
+    t.start()
+
+
 if __name__ == '__main__':
-    print("=" * 60)
-    print("🚀 LC79 AUTO WEB — 35 AI CORES + AUTO BET + X2")
-    print("🌐 Truy cập: http://localhost:5000")
-    print("=" * 60)
+    print("=" * 64)
+    print("🚀 LC79 AUTO WEB VIP V4")
+    print("🧠 35 AI Cores + Exponential Weighting")
+    print("🛰️  Background Collector: HuyDaiXuLC79 (auto login 24/7)")
+    print("💵 Auto Bet REAL + X2 + Manual Bet")
+    print("🌐 http://localhost:5000")
+    print("=" * 64)
+    start_bg_thread()
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
