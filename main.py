@@ -1,1518 +1,815 @@
+from flask import Flask, render_template_string, request, jsonify
 import requests
 import hashlib
 import base64
 import json
-import logging
-import threading
 import time
-import socketio
+import threading
 import random
-import math
-import secrets
-from flask import Flask, render_template_string, request, jsonify
 
-# ==========================================
-# CẤU HÌNH
-# ==========================================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-logging.getLogger('engineio').setLevel(logging.WARNING)
-logging.getLogger('urllib3').setLevel(logging.WARNING)
+import socketio
 
 app = Flask(__name__)
-MAX_GLOBAL_HISTORY = 2000
 
-# 🔴 BACKGROUND COLLECTOR ACCOUNT (auto login chạy ngầm)
-DATA_COLLECTOR_USER = "HuyDaiXuLC79"
-DATA_COLLECTOR_PASS = "GiaHuy2011@"
+# ==========================================================
+# ⚙️ CẤU HÌNH
+# ==========================================================
+COLLECTOR_USER = "HuyDaiXuLC79"
+COLLECTOR_PASS = "GiaHuy2011@"
 
-# ==========================================
-# GLOBAL STATE
-# ==========================================
-GLOBAL_HISTORY = []
-GLOBAL_AI_WEIGHTS = {
-    "trend": 1.0, "pattern": 1.0, "frequency": 1.0, "momentum": 1.0, "symmetry": 1.0,
-    "alternating": 1.0, "fibonacci": 1.0, "chaos": 1.0, "shadow": 1.0,
-    "markov1": 1.0, "markov2": 1.0, "markov3": 1.0,
-    "rsi_indicator": 1.0, "macd_cross": 1.0, "pivot_reversal": 1.0, "cluster_3": 1.0,
-    "parity": 1.0, "golden_ratio": 1.0, "quantum": 1.0,
-    "anti_bait": 2.0, "smart_breaker": 2.0,
-    "ngram_4": 1.5, "ngram_5": 1.5, "elliott_wave": 1.5, "contrarian": 2.0,
-    "bollinger_bands": 1.5, "mean_reversion": 1.0, "mirror_reflection": 1.0,
-    "martingale_trap": 1.5, "poisson_prob": 1.0, "harmonic_cycle": 1.0,
-    "breakout_hunter": 1.5, "volume_fakeout": 1.5, "time_decay": 1.0,
-    "neural_bias": 1.0, "twin_peaks": 1.0
-}
-GLOBAL_MODEL_STREAK = {k: 0 for k in GLOBAL_AI_WEIGHTS.keys()}
-GLOBAL_LAST_PREDICTIONS = {}
-GLOBAL_CURRENT_PREDICTION = None
-GLOBAL_LAST_SESSION_ID = None
-GLOBAL_PROCESSED_SESSIONS = set()
-GLOBAL_LOCK = threading.Lock()
+WS_URL          = "https://wtxmd52.tele68.com"
+WS_PATH         = "txmd5/"
+WS_NAMESPACE    = "/txmd5"
+WS_MAX_RETRY    = 999
+RECONNECT_DELAY = 8
+LOGIN_DELAY     = 15
 
-# Background collector status
-BG_STATE = {
-    "running": False,
-    "connected": False,
+MAX_HISTORY   = 200
+MAX_LOGS      = 100
+MIN_TRAIN     = 10   # cần 10 phiên để AI predict
+
+# ==========================================================
+# 🌐 STATE
+# ==========================================================
+LOCK = threading.RLock()
+
+STATE = {
+    # auth
+    "logged_in": False,
     "nickname": None,
-    "session_id": None,
-    "last_seen": None,
-    "login_count": 0,
-    "error": None
+    "username": COLLECTOR_USER,
+    "balance": 0,
+
+    # ws
+    "ws_connected": False,
+    "ws_error": None,
+    "ws_connected_at": None,
+
+    # session
+    "current_session": None,
+    "current_state": None,
+    "current_prediction": None,
+    "current_result": None,     # {"result": "TAI", "dices": [...], "ok": bool}
+
+    # history
+    "history": [],              # ["TAI","XIU",...]
+    "sessions": [],             # [{"id","result","dices","pred","ok","ts"}]
+    "logs": [],
+
+    # AI stats
+    "ai_correct": 0,
+    "ai_total": 0,
 }
-BG_LOCK = threading.Lock()
-BG_THREAD_STARTED = False
 
-USER_SESSIONS = {}
-USERNAME_TO_TOKEN = {}
-SESSION_LOCK = threading.Lock()
+AI_WEIGHTS = {f"core_{i:02d}": 1.0 for i in range(1, 36)}
+WS_CLIENT = {"sio": None}
 
 
-def md5_hash(text: str) -> str:
-    return hashlib.md5(text.encode('utf-8')).hexdigest()
+def log(msg: str):
+    with LOCK:
+        STATE["logs"].append({"t": time.time(), "msg": msg})
+        if len(STATE["logs"]) > MAX_LOGS:
+            STATE["logs"] = STATE["logs"][-MAX_LOGS:]
+    print(f"[BG] {msg}", flush=True)
 
 
-# ==========================================
-# 🧠 35 LÕI AI
-# ==========================================
+# ==========================================================
+# 🧠 AI 35 CORES
+# ==========================================================
+def _vote_core(idx: int, hist: list):
+    n = len(hist)
+    if n < 6:
+        return None
+    if idx <= 7:
+        w = 3 + (idx - 1)
+        seg = hist[-w:]
+        return "TAI" if seg.count("TAI") > seg.count("XIU") else "XIU"
+    if idx <= 14:
+        last = hist[-1]
+        cnt = 0
+        for v in reversed(hist):
+            if v == last:
+                cnt += 1
+            else:
+                break
+        if cnt >= 3:
+            return "XIU" if last == "TAI" else "TAI"
+        return last
+    if idx <= 21:
+        last3 = hist[-3:]
+        if last3[0] == last3[2] and last3[1] != last3[0]:
+            return last3[1]
+        return "TAI" if hist[-1] == "XIU" else "XIU"
+    if idx <= 28:
+        w = 8 + (idx - 22)
+        seg = hist[-w:]
+        return "TAI" if seg.count("TAI") > seg.count("XIU") else "XIU"
+    w = 5 + (idx - 29)
+    seg = hist[-w:]
+    tai, xiu = seg.count("TAI"), seg.count("XIU")
+    if tai == xiu:
+        return hist[-1]
+    return "TAI" if tai > xiu else "XIU"
+
+
 def make_prediction_vip():
-    with GLOBAL_LOCK:
-        history = list(GLOBAL_HISTORY)
-        weights = dict(GLOBAL_AI_WEIGHTS)
-
-    if len(history) < 10:
-        return random.choice(["TAI", "XIU"]), {}
-
-    model_preds = {}
-    last_item = history[-1]
-    opp_item = "XIU" if last_item == "TAI" else "TAI"
-    recent_str = "".join(["T" if x == "TAI" else "X" for x in history])
-    streak = len(recent_str) - len(recent_str.rstrip(recent_str[-1]))
-
-    model_preds["trend"] = last_item if history[-5:].count(last_item) >= 3 else opp_item
-    model_preds["pattern"] = opp_item if recent_str.endswith("TXTX") or recent_str.endswith("TTXX") else last_item
-
-    t1 = {"TAI": {"TAI": 0, "XIU": 0}, "XIU": {"TAI": 0, "XIU": 0}}
-    for i in range(len(history) - 1):
-        t1[history[i]][history[i+1]] += 1
-    model_preds["markov1"] = "TAI" if t1[last_item]["TAI"] > t1[last_item]["XIU"] else "XIU"
-    model_preds["markov2"] = "TAI" if history[-2:] == ["TAI", "TAI"] else "XIU"
-    model_preds["markov3"] = opp_item if history[-3:] == [last_item]*3 else model_preds["markov2"]
-
-    model_preds["frequency"] = "XIU" if history[-20:].count("TAI") > 10 else "TAI"
-    model_preds["momentum"] = "TAI" if sum([i+1 if r == "TAI" else -(i+1) for i, r in enumerate(history[-5:])]) > 0 else "XIU"
-    model_preds["symmetry"] = opp_item if len(recent_str) >= 6 and recent_str[-6:-3] == recent_str[-3:][::-1] else last_item
-    model_preds["alternating"] = opp_item
-    model_preds["fibonacci"] = opp_item if streak in [3, 5, 8, 13] else last_item
-    model_preds["chaos"] = opp_item if sum(1 for i in range(len(recent_str[-10:]) - 1) if recent_str[-10:][i] != recent_str[-10:][i+1]) >= 7 else last_item
-    model_preds["shadow"] = "TAI" if history[-50:].count("TAI") < 25 else "XIU"
-
-    rsi_score = recent_str[-10:].count("T")
-    model_preds["rsi_indicator"] = "XIU" if rsi_score >= 7 else ("TAI" if rsi_score <= 3 else last_item)
-    model_preds["macd_cross"] = "TAI" if recent_str[-3:].count("T") > (recent_str[-9:].count("T") / 3) else "XIU"
-    model_preds["pivot_reversal"] = history[-1] if history[-3] == history[-2] and history[-2] != history[-1] else last_item
-    model_preds["cluster_3"] = "TAI" if recent_str[-3:] in ["TTT", "TXX", "XTX", "XXT"] else "XIU"
-    model_preds["parity"] = opp_item if streak % 2 == 0 else last_item
-    model_preds["golden_ratio"] = "TAI" if (history[-30:].count("TAI") / 30) < 0.618 else "XIU"
-    model_preds["quantum"] = random.choice(["TAI", "XIU"])
-
-    model_preds["anti_bait"] = opp_item if streak >= 5 or recent_str.endswith("TXTXT") else last_item
-
-    max_streak = 1; cur = 1
-    for i in range(1, len(history)):
-        if history[i] == history[i-1]: cur += 1
-        else: max_streak = max(max_streak, cur); cur = 1
-    model_preds["smart_breaker"] = opp_item if streak >= max_streak - 1 and streak >= 3 else last_item
-
-    l4 = recent_str[-4:]
-    t_c4 = recent_str[:-1].count(l4 + "T")
-    x_c4 = recent_str[:-1].count(l4 + "X")
-    model_preds["ngram_4"] = "TAI" if t_c4 > x_c4 else ("XIU" if x_c4 > t_c4 else opp_item)
-
-    l5 = recent_str[-5:]
-    t_c5 = recent_str[:-1].count(l5 + "T")
-    x_c5 = recent_str[:-1].count(l5 + "X")
-    model_preds["ngram_5"] = "TAI" if t_c5 > x_c5 else ("XIU" if x_c5 > t_c5 else opp_item)
-
-    if recent_str.endswith("TXTXT"): model_preds["elliott_wave"] = last_item
-    elif recent_str.endswith("TTXXTT"): model_preds["elliott_wave"] = "XIU"
-    else: model_preds["elliott_wave"] = opp_item
-
-    if streak == 4 or streak == 6: model_preds["contrarian"] = opp_item
-    elif recent_str[-6:] == "TXTXTX": model_preds["contrarian"] = "XIU"
-    else: model_preds["contrarian"] = last_item
-
-    ma10 = recent_str[-10:].count("T") / 10.0
-    if ma10 >= 0.8: model_preds["bollinger_bands"] = "XIU"
-    elif ma10 <= 0.2: model_preds["bollinger_bands"] = "TAI"
-    else: model_preds["bollinger_bands"] = last_item
-
-    t_total = history[-100:].count("TAI") if len(history) >= 100 else history.count("TAI")
-    model_preds["mean_reversion"] = "TAI" if t_total < (len(history[-100:]) * 0.45) else "XIU"
-
-    if len(recent_str) >= 8:
-        model_preds["mirror_reflection"] = "TAI" if recent_str[-8] == "T" else "XIU"
-    else: model_preds["mirror_reflection"] = opp_item
-
-    model_preds["martingale_trap"] = opp_item if streak == 3 or streak == 7 else last_item
-    model_preds["poisson_prob"] = "TAI" if (history[-5:].count("TAI") % 2 == 1) else "XIU"
-    model_preds["harmonic_cycle"] = history[-4] if len(history) >= 4 else opp_item
-    model_preds["breakout_hunter"] = last_item if streak == 1 and history[-2] == history[-3] else opp_item
-
-    if len(recent_str) >= 5 and recent_str[-5:] in ["TTTXT", "XXXTX"]:
-        model_preds["volume_fakeout"] = last_item
-    else: model_preds["volume_fakeout"] = opp_item
-
-    model_preds["time_decay"] = opp_item
-    model_preds["neural_bias"] = "TAI" if history[-7:].count("TAI") > 3 else "XIU"
-    model_preds["twin_peaks"] = opp_item if recent_str.endswith("TTXTT") or recent_str.endswith("XXTXX") else last_item
-
-    predictions = {"TAI": 0.0, "XIU": 0.0}
-    for model, pred in model_preds.items():
-        if model in weights:
-            predictions[pred] += math.pow(weights[model], 1.5)
-
-    return ("TAI" if predictions["TAI"] > predictions["XIU"] else "XIU"), model_preds
+    with LOCK:
+        hist = list(STATE["history"])
+    if len(hist) < MIN_TRAIN:
+        return None
+    tai_s = xiu_s = 0.0
+    for i in range(1, 36):
+        v = _vote_core(i, hist)
+        if not v:
+            continue
+        w = AI_WEIGHTS.get(f"core_{i:02d}", 1.0)
+        if v == "TAI":
+            tai_s += w
+        else:
+            xiu_s += w
+    if tai_s == xiu_s:
+        return random.choice(["TAI", "XIU"])
+    return "TAI" if tai_s > xiu_s else "XIU"
 
 
-# ==========================================
-# 🔐 LOGIN — HASH SERVER-SIDE (giống hệt bot)
-# ==========================================
-def do_login(username: str, password: str):
-    """
-    Nhận PLAINTEXT password, hash MD5 ở server-side giống hệt bot code.
-    Trả về đầy đủ session_data đã decode.
-    """
+def update_ai_weights(result: str):
+    with LOCK:
+        hist = list(STATE["history"])
+    if len(hist) < 6:
+        return
+    for i in range(1, 36):
+        key = f"core_{i:02d}"
+        v = _vote_core(i, hist[:-1])
+        if not v:
+            continue
+        if v == result:
+            AI_WEIGHTS[key] = min(AI_WEIGHTS[key] + 0.05, 5.0)
+        else:
+            AI_WEIGHTS[key] = max(AI_WEIGHTS[key] - 0.03, 0.1)
+
+
+# ==========================================================
+# 🌐 LOGIN
+# ==========================================================
+def md5_hash(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def login_and_get_token(username: str, password: str) -> dict:
+    pw_md5 = md5_hash(password) if len(password) != 32 else password
+    url = (
+        f"https://apifo88daigia.tele68.com/api"
+        f"?c=3&un={username}&pw={pw_md5}&cp=R&cl=R&pf=web&at="
+    )
     try:
-        pw_md5 = md5_hash(password)
-        url = f"https://apifo88daigia.tele68.com/api?c=3&un={username}&pw={pw_md5}&cp=R&cl=R&pf=web&at="
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=12)
         r.raise_for_status()
-        data = r.json()
+        game = r.json()
+        if not game.get("success"):
+            return {"_error": f"Game API: {game.get('message', 'Sai thông tin')}"}
 
-        if not data.get("success"):
-            return {"success": False, "message": data.get("message", "Sai thông tin đăng nhập")}
-
-        session_key = data["sessionKey"]
-        session_key_padded = session_key + "=" * ((4 - len(session_key) % 4) % 4)
-        session_data = json.loads(base64.b64decode(session_key_padded).decode('utf-8'))
+        sk = game.get("sessionKey", "")
+        sk += "=" * ((4 - len(sk) % 4) % 4)
+        session_data = json.loads(base64.b64decode(sk).decode("utf-8"))
         nickname = session_data.get("nickname") or session_data.get("nickName")
 
-        access_token = data["accessToken"]
         r2 = requests.post(
             "https://wlb.tele68.com/v1/lobby/auth/login?cp=R&cl=R&pf=web&at=",
-            headers={"authority": "wlb.tele68.com", "content-type": "application/json"},
-            json={"nickName": nickname, "accessToken": access_token}, timeout=15
+            headers={
+                "authority": "wlb.tele68.com",
+                "content-type": "application/json",
+                "accept": "application/json, text/plain, */*",
+                "origin": "https://tele68.com",
+                "referer": "https://tele68.com/",
+                "user-agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            },
+            json={"nickName": nickname, "accessToken": game.get("accessToken")},
+            timeout=12,
         )
+        r2.raise_for_status()
         lobby = r2.json()
-        game_token = lobby.get("token")
-
-        if not game_token:
-            return {"success": False, "message": "Lobby không trả về JWT token"}
+        token = lobby.get("token")
+        if not token:
+            return {"_error": "Lobby không trả JWT."}
 
         return {
-            "success": True,
-            "game_token": game_token,
+            "token": token,
             "nickname": nickname,
             "money": lobby.get("remoteLoginResp", {}).get("money", 0),
-            "session_data": session_data,
-            "pw_md5": pw_md5,     # debug — chứng minh hash real
-            "access_token": access_token[:20] + "...",  # debug
-            "raw": data
         }
     except Exception as e:
-        return {"success": False, "message": f"Lỗi kết nối: {e}"}
+        return {"_error": f"Kết nối: {e}"}
 
 
-# ==========================================
-# 🛰️ BACKGROUND COLLECTOR — chạy 24/7 (giống bot)
-# ==========================================
-def background_data_collector():
-    logger.info("🚀 Background Collector bắt đầu (HuyDaiXuLC79)")
-    with BG_LOCK:
-        BG_STATE["running"] = True
+# ==========================================================
+# 🔌 WEBSOCKET (blocking — chạy trong thread nền)
+# ==========================================================
+def run_ws_blocking(token: str):
+    """Blocking: connect → listen → disconnect → return."""
+    sio = socketio.Client(
+        reconnection=True,
+        reconnection_attempts=WS_MAX_RETRY,
+        logger=False,
+        engineio_logger=False,
+    )
+    WS_CLIENT["sio"] = sio
 
-    while True:
-        try:
-            result = do_login(DATA_COLLECTOR_USER, DATA_COLLECTOR_PASS)
-            if not result.get("success"):
-                logger.error(f"BG login fail: {result.get('message')}")
-                with BG_LOCK:
-                    BG_STATE["error"] = result.get("message")
-                time.sleep(20)
-                continue
-
-            logger.info(f"✅ BG login OK: {result['nickname']} | Money: {result['money']:,}")
-            with BG_LOCK:
-                BG_STATE["nickname"] = result["nickname"]
-                BG_STATE["login_count"] += 1
-                BG_STATE["error"] = None
-                BG_STATE["last_seen"] = time.time()
-
-            start_game_socket("BACKGROUND_WORKER", result["game_token"], is_background=True)
-        except Exception as e:
-            logger.error(f"BG collector error: {e}")
-            with BG_LOCK:
-                BG_STATE["error"] = str(e)
-
-        with BG_LOCK:
-            BG_STATE["connected"] = False
-        time.sleep(20)
-
-
-# ==========================================
-# 🌐 GAME SOCKET (WSS REAL)
-# ==========================================
-def add_log(token_id, msg):
-    with SESSION_LOCK:
-        if token_id in USER_SESSIONS:
-            USER_SESSIONS[token_id]["log"].append({
-                "time": time.strftime("%H:%M:%S"),
-                "msg": msg
-            })
-            if len(USER_SESSIONS[token_id]["log"]) > 100:
-                USER_SESSIONS[token_id]["log"] = USER_SESSIONS[token_id]["log"][-100:]
-
-
-def start_game_socket(token_id, game_token, is_background=False):
-    if not is_background:
-        with SESSION_LOCK:
-            if token_id not in USER_SESSIONS:
-                return
-
-    sio = socketio.Client(reconnection=True, reconnection_attempts=50, logger=False, engineio_logger=False)
-
-    @sio.event(namespace='/txmd5')
+    @sio.event(namespace=WS_NAMESPACE)
     def connect():
-        if is_background:
-            logger.info("[BG] ✅ WSS connected")
-            with BG_LOCK:
-                BG_STATE["connected"] = True
-                BG_STATE["last_seen"] = time.time()
-        else:
-            with SESSION_LOCK:
-                if token_id in USER_SESSIONS:
-                    USER_SESSIONS[token_id]["game_connected"] = True
-            add_log(token_id, "✅ WSS kết nối thành công")
+        with LOCK:
+            STATE["ws_connected"] = True
+            STATE["ws_error"] = None
+            STATE["ws_connected_at"] = time.time()
+        log("🟢 WebSocket LIVE — bắt đầu thu thập phiên")
 
-    @sio.event(namespace='/txmd5')
+    @sio.event(namespace=WS_NAMESPACE)
     def disconnect():
-        if is_background:
-            logger.warning("[BG] ❌ WSS disconnected")
-            with BG_LOCK:
-                BG_STATE["connected"] = False
-        else:
-            with SESSION_LOCK:
-                if token_id in USER_SESSIONS:
-                    USER_SESSIONS[token_id]["game_connected"] = False
-            add_log(token_id, "❌ WSS mất kết nối")
+        with LOCK:
+            STATE["ws_connected"] = False
+        log("🔴 WebSocket ngắt kết nối — sẽ tự reconnect")
 
-    @sio.on('new-session', namespace='/txmd5')
+    @sio.on("new-session", namespace=WS_NAMESPACE)
     def on_new_session(data):
-        my_session_id = data.get('id', 'N/A')
+        sid = data.get("id", "N/A")
+        with LOCK:
+            STATE["current_session"] = sid
+            STATE["current_state"] = "BETTING"
+            STATE["current_result"] = None
 
-        # Global prediction — AI dùng chung cho mọi kết nối
-        with GLOBAL_LOCK:
-            if GLOBAL_LAST_SESSION_ID != my_session_id or GLOBAL_CURRENT_PREDICTION is None:
-                pred, model_preds = make_prediction_vip()
-                GLOBAL_LAST_PREDICTIONS.clear()
-                GLOBAL_LAST_PREDICTIONS.update(model_preds)
-                GLOBAL_LAST_SESSION_ID = my_session_id
-                GLOBAL_CURRENT_PREDICTION = pred
-                logger.info(f"🧠 AI dự đoán phiên {my_session_id}: {pred}")
-            current_pred = GLOBAL_CURRENT_PREDICTION
+            pred = make_prediction_vip() if len(STATE["history"]) >= MIN_TRAIN else None
+            STATE["current_prediction"] = pred
 
-        if is_background:
-            with BG_LOCK:
-                BG_STATE["session_id"] = my_session_id
-                BG_STATE["last_seen"] = time.time()
-            return
+            STATE["sessions"].append({
+                "id": sid, "result": None, "dices": None,
+                "pred": pred, "ok": None, "ts": time.time(),
+            })
+            if len(STATE["sessions"]) > 100:
+                STATE["sessions"] = STATE["sessions"][-100:]
 
-        with SESSION_LOCK:
-            if token_id not in USER_SESSIONS:
-                return
-            session = USER_SESSIONS[token_id]
-            is_new_session = session["session_id"] != my_session_id
-            session["session_id"] = my_session_id
-            if is_new_session:
-                session["has_bet_this_session"] = False
-                session["current_result"] = None
-                session["dices"] = None
+            hist_n = len(STATE["history"])
+        tag = f" · AI: {pred}" if pred else f" · chờ ({hist_n}/{MIN_TRAIN})"
+        log(f"🔔 Phiên mới #{sid}{tag}")
 
-            session["current_prediction"] = current_pred
+    @sio.on("tick-update", namespace=WS_NAMESPACE)
+    def on_tick(data):
+        gs = data.get("state")
+        with LOCK:
+            STATE["current_state"] = gs
 
-            if session["x2_mode"] and session["win_streak"] >= 1:
-                session["current_bet"] = session["base_bet"] * 2
-            else:
-                session["current_bet"] = session["base_bet"]
-
-            if (session["auto_bet"] and session["target_profit"]
-                    and session["target_profit"] > 0
-                    and session["profit_loss"] >= session["target_profit"]):
-                session["auto_bet"] = False
-                add_log(token_id, f"🏆 ĐẠT TARGET +{session['target_profit']:,} — TẮT AUTO")
-
-        add_log(token_id, f"🔔 Phiên {my_session_id} | {current_pred} | Cược: {session['current_bet']:,}")
-
-    @sio.on('tick-update', namespace='/txmd5')
-    def on_tick_update(data):
-        if is_background:
-            return
-        game_state = data.get('state')
-        with SESSION_LOCK:
-            if token_id not in USER_SESSIONS:
-                return
-            session = USER_SESSIONS[token_id]
-            if (game_state == 'BETTING' and session["auto_bet"]
-                    and session["current_prediction"] and not session["has_bet_this_session"]):
-                try:
-                    sio.emit('bet', {
-                        "type": session["current_prediction"],
-                        "amount": session["current_bet"]
-                    }, namespace='/txmd5')
-                    session["has_bet_this_session"] = True
-                    session["waiting_for_result"] = True
-                    add_log(token_id, f"🚀 BET REAL: {session['current_bet']:,} → {session['current_prediction']}")
-                except Exception as e:
-                    add_log(token_id, f"⚠️ Lỗi bet: {e}")
-
-    @sio.on('bet-result', namespace='/txmd5')
+    @sio.on("bet-result", namespace=WS_NAMESPACE)
     def on_bet_result(data):
-        if is_background:
-            return
-        with SESSION_LOCK:
-            if token_id in USER_SESSIONS and "postBalance" in data:
-                USER_SESSIONS[token_id]["balance"] = data["postBalance"]
-        try:
-            sio.emit('get-current-my-info', None, namespace='/txmd5')
-        except:
-            pass
+        with LOCK:
+            if "postBalance" in data:
+                STATE["balance"] = data["postBalance"]
 
-    @sio.on('session-result', namespace='/txmd5')
+    @sio.on("session-result", namespace=WS_NAMESPACE)
     def on_session_result(data):
-        result = data.get('resultTruyenThong', 'N/A')
-        dices = data.get('dices', [0, 0, 0])
+        result = data.get("resultTruyenThong", "N/A")
+        dices = data.get("dices", [0, 0, 0])
 
-        if is_background:
-            with BG_LOCK:
-                my_session_id = BG_STATE["session_id"]
-                BG_STATE["last_seen"] = time.time()
-        else:
-            with SESSION_LOCK:
-                if token_id not in USER_SESSIONS:
-                    return
-                my_session_id = USER_SESSIONS[token_id].get("session_id")
-
-        # Cập nhật history (dedup theo session_id)
-        if result in ["TAI", "XIU"] and my_session_id:
-            with GLOBAL_LOCK:
-                if my_session_id not in GLOBAL_PROCESSED_SESSIONS:
-                    GLOBAL_PROCESSED_SESSIONS.add(my_session_id)
-                    GLOBAL_HISTORY.append(result)
-                    if len(GLOBAL_HISTORY) > MAX_GLOBAL_HISTORY:
-                        GLOBAL_HISTORY.pop(0)
-
-                    for model, pred in GLOBAL_LAST_PREDICTIONS.items():
-                        if pred == result:
-                            GLOBAL_MODEL_STREAK[model] += 1
-                            bonus = 0.5 + (0.2 * GLOBAL_MODEL_STREAK[model])
-                            GLOBAL_AI_WEIGHTS[model] = min(20.0, GLOBAL_AI_WEIGHTS[model] + bonus)
-                        else:
-                            GLOBAL_MODEL_STREAK[model] = 0
-                            GLOBAL_AI_WEIGHTS[model] = max(0.1, GLOBAL_AI_WEIGHTS[model] - 2.5)
-
-                    if len(GLOBAL_PROCESSED_SESSIONS) > 1000:
-                        GLOBAL_PROCESSED_SESSIONS = set(list(GLOBAL_PROCESSED_SESSIONS)[-500:])
-
-            if is_background:
-                logger.info(f"[BG] KQ {my_session_id}: {result}")
-                return
-
-        if is_background:
+        if result not in ("TAI", "XIU"):
             return
 
-        with SESSION_LOCK:
-            if token_id not in USER_SESSIONS:
-                return
-            session = USER_SESSIONS[token_id]
-            session["current_result"] = result
-            session["dices"] = dices
+        with LOCK:
+            pred = STATE["current_prediction"]
+            ok = (pred == result) if pred else None
 
-            if session["current_prediction"] and session["waiting_for_result"]:
-                if session["current_prediction"] == result:
-                    win_amt = int(session["current_bet"] * 0.98)
-                    session["profit_loss"] += win_amt
-                    session["win_streak"] += 1
-                    add_log(token_id, f"✅ THẮNG +{win_amt:,} | Chuỗi: {session['win_streak']}")
-                else:
-                    session["profit_loss"] -= session["current_bet"]
-                    session["win_streak"] = 0
-                    add_log(token_id, f"❌ THUA -{session['current_bet']:,} | Reset chuỗi")
-                session["waiting_for_result"] = False
+            # stats
+            if pred:
+                STATE["ai_total"] += 1
+                if ok:
+                    STATE["ai_correct"] += 1
 
-        add_log(token_id, f"🎲 KQ: {result} ({dices[0]}-{dices[1]}-{dices[2]})")
+            STATE["current_result"] = {
+                "result": result, "dices": dices, "ok": ok,
+            }
+
+            # cập nhật session gần nhất
+            if STATE["sessions"]:
+                STATE["sessions"][-1]["result"] = result
+                STATE["sessions"][-1]["dices"] = dices
+                STATE["sessions"][-1]["ok"] = ok
+
+            # lưu history
+            STATE["history"].append(result)
+            if len(STATE["history"]) > MAX_HISTORY:
+                STATE["history"] = STATE["history"][-MAX_HISTORY:]
+
+        update_ai_weights(result)
+
+        mark = "✅" if ok else ("❌" if ok is False else "⚪")
+        log(f"{mark} {result} ({dices[0]}-{dices[1]}-{dices[2]})"
+            + (f" · AI đoán {pred}" if pred else ""))
 
     try:
         sio.connect(
-            'https://wtxmd52.tele68.com',
-            socketio_path='txmd5/',
-            namespaces=['/txmd5'],
-            transports=['websocket'],
-            auth={"token": game_token},
-            headers={"User-Agent": "Mozilla/5.0"}
+            WS_URL,
+            socketio_path=WS_PATH,
+            namespaces=[WS_NAMESPACE],
+            transports=["websocket"],
+            auth={"token": token},
+            headers={"User-Agent": "Mozilla/5.0"},
         )
-        if not is_background:
-            with SESSION_LOCK:
-                if token_id in USER_SESSIONS:
-                    USER_SESSIONS[token_id]["sio"] = sio
         sio.wait()
     except Exception as e:
-        logger.error(f"Socket error ({token_id}): {e}")
-        if is_background:
-            with BG_LOCK:
-                BG_STATE["connected"] = False
-                BG_STATE["error"] = str(e)
-        else:
-            add_log(token_id, f"⚠️ Socket error: {e}")
-            with SESSION_LOCK:
-                if token_id in USER_SESSIONS:
-                    USER_SESSIONS[token_id]["game_connected"] = False
+        with LOCK:
+            STATE["ws_connected"] = False
+            STATE["ws_error"] = str(e)
+        log(f"⚠️ WS error: {e}")
 
 
-# ==========================================
-# 🚀 FLASK API
-# ==========================================
-@app.route('/api/login', methods=['POST'])
-def api_login():
-    data = request.json or {}
-    username = data.get('username', '').strip()
-    password = data.get('password', '')  # PLAINTEXT — hash ở server
+# ==========================================================
+# ♻️ BACKGROUND WORKER — chạy 24/7
+# ==========================================================
+def background_worker():
+    log(f"🚀 Background collector khởi động · acc={COLLECTOR_USER}")
+    while True:
+        try:
+            res = login_and_get_token(COLLECTOR_USER, COLLECTOR_PASS)
+            if "_error" in res:
+                with LOCK:
+                    STATE["ws_error"] = res["_error"]
+                log(f"❌ Login fail: {res['_error']}")
+                time.sleep(LOGIN_DELAY)
+                continue
 
-    if not username or not password:
-        return jsonify({"success": False, "message": "Thiếu thông tin"})
+            with LOCK:
+                STATE["logged_in"] = True
+                STATE["nickname"] = res["nickname"]
+                STATE["balance"] = res["money"]
+            log(f"🔑 Login OK · {res['nickname']} · dư {res['money']:,}")
 
-    result = do_login(username, password)
-    if not result.get("success"):
-        return jsonify({"success": False, "message": result.get("message", "Đăng nhập thất bại")})
+            run_ws_blocking(res["token"])
 
-    # Xoá session cũ
-    with SESSION_LOCK:
-        old_token = USERNAME_TO_TOKEN.get(username)
-        if old_token and old_token in USER_SESSIONS:
-            try:
-                if USER_SESSIONS[old_token].get("sio"):
-                    USER_SESSIONS[old_token]["sio"].disconnect()
-            except:
-                pass
-            del USER_SESSIONS[old_token]
+        except Exception as e:
+            log(f"⚠️ Worker error: {e}")
 
-    token_id = secrets.token_urlsafe(32)
-    with SESSION_LOCK:
-        USER_SESSIONS[token_id] = {
-            "username": username,
-            "nickname": result["nickname"],
-            "balance": result["money"],
-            "game_token": result["game_token"],
-            "session_data": result["session_data"],
-            "sio": None,
-            "game_connected": False,
-            "session_id": None,
-            "auto_bet": False,
-            "base_bet": 10000,
-            "current_bet": 10000,
-            "x2_mode": False,
-            "win_streak": 0,
-            "profit_loss": 0,
-            "target_profit": None,
-            "current_prediction": None,
-            "waiting_for_result": False,
-            "has_bet_this_session": False,
-            "current_result": None,
-            "dices": None,
-            "log": []
-        }
-        USERNAME_TO_TOKEN[username] = token_id
-
-    threading.Thread(target=start_game_socket,
-                     args=(token_id, result["game_token"], False),
-                     daemon=True).start()
-
-    return jsonify({
-        "success": True,
-        "server_token": token_id,
-        "nickname": result["nickname"],
-        "money": result["money"],
-        "session_data": result["session_data"],     # 🔥 trả về luôn, không cần client decode
-        "curLevel": result["session_data"].get("curLevel", 1),
-        "debug_hash": result["pw_md5"],             # chứng minh hash real
-    })
+        log(f"⏳ Thử login lại sau {RECONNECT_DELAY}s...")
+        time.sleep(RECONNECT_DELAY)
 
 
-@app.route('/api/state')
+_bg_started = False
+_bg_lock = threading.Lock()
+
+
+def ensure_background():
+    global _bg_started
+    with _bg_lock:
+        if _bg_started:
+            return
+        _bg_started = True
+    threading.Thread(target=background_worker, daemon=True).start()
+
+
+# ==========================================================
+# ROUTES
+# ==========================================================
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+
+@app.route("/api/state")
 def api_state():
-    token_id = request.headers.get('X-Session-Token')
-    with SESSION_LOCK:
-        if not token_id or token_id not in USER_SESSIONS:
-            return jsonify({"error": "unauthorized"}), 401
-        session = USER_SESSIONS[token_id]
-        weights_sorted = sorted(
-            [(k, round(v, 2)) for k, v in GLOBAL_AI_WEIGHTS.items()],
-            key=lambda x: -x[1]
-        )[:10]
-
-        with BG_LOCK:
-            bg_status = {
-                "running": BG_STATE["running"],
-                "connected": BG_STATE["connected"],
-                "nickname": BG_STATE["nickname"],
-                "session_id": BG_STATE["session_id"],
-                "last_seen": BG_STATE["last_seen"],
-                "login_count": BG_STATE["login_count"],
-                "error": BG_STATE["error"]
-            }
-
+    with LOCK:
         return jsonify({
-            "nickname": session["nickname"],
-            "balance": session["balance"],
-            "game_connected": session["game_connected"],
-            "session_id": session["session_id"],
-            "auto_bet": session["auto_bet"],
-            "base_bet": session["base_bet"],
-            "current_bet": session["current_bet"],
-            "x2_mode": session["x2_mode"],
-            "win_streak": session["win_streak"],
-            "profit_loss": session["profit_loss"],
-            "target_profit": session["target_profit"],
-            "current_prediction": session["current_prediction"],
-            "waiting_for_result": session["waiting_for_result"],
-            "current_result": session["current_result"],
-            "dices": session["dices"],
-            "history": GLOBAL_HISTORY[-30:],
-            "history_len": len(GLOBAL_HISTORY),
-            "log": session["log"][-25:],
-            "ai_weights": weights_sorted,
-            "session_data": session["session_data"],
-            "bg_status": bg_status
+            "logged_in": STATE["logged_in"],
+            "nickname": STATE["nickname"],
+            "balance": STATE["balance"],
+            "ws_connected": STATE["ws_connected"],
+            "ws_error": STATE["ws_error"],
+            "current_session": STATE["current_session"],
+            "current_state": STATE["current_state"],
+            "current_prediction": STATE["current_prediction"],
+            "current_result": STATE["current_result"],
+            "history": STATE["history"][-50:],
+            "recent_10": STATE["history"][-10:],
+            "ai_correct": STATE["ai_correct"],
+            "ai_total": STATE["ai_total"],
+            "ai_accuracy": round(
+                (STATE["ai_correct"] / STATE["ai_total"] * 100) if STATE["ai_total"] else 0,
+                1
+            ),
+            "ai_weights_top": sorted(
+                AI_WEIGHTS.items(), key=lambda x: x[1], reverse=True
+            )[:10],
+            "logs": STATE["logs"][-30:],
         })
 
 
-@app.route('/api/settings', methods=['POST'])
-def api_settings():
-    token_id = request.headers.get('X-Session-Token')
-    if not token_id or token_id not in USER_SESSIONS:
-        return jsonify({"error": "unauthorized"}), 401
-
-    data = request.json or {}
-    with SESSION_LOCK:
-        if token_id not in USER_SESSIONS:
-            return jsonify({"error": "session expired"}), 401
-        session = USER_SESSIONS[token_id]
-
-        if 'auto_bet' in data:
-            session["auto_bet"] = bool(data["auto_bet"])
-            add_log(token_id, "🟢 BẬT Auto Cược" if data["auto_bet"] else "🔴 TẮT Auto Cược")
-        if 'base_bet' in data:
-            try:
-                val = max(1000, int(data["base_bet"]))
-                session["base_bet"] = val
-                add_log(token_id, f"⚙️ Vốn gốc: {val:,}")
-            except:
-                pass
-        if 'x2_mode' in data:
-            session["x2_mode"] = bool(data["x2_mode"])
-            add_log(token_id, "🔥 BẬT X2" if data["x2_mode"] else "🔴 TẮT X2")
-        if 'target_profit' in data:
-            try:
-                val = int(data["target_profit"])
-                session["target_profit"] = val if val > 0 else None
-            except:
-                session["target_profit"] = None
-
-    return jsonify({"ok": True})
-
-
-@app.route('/api/manual-bet', methods=['POST'])
-def api_manual_bet():
-    """Đặt cược thủ công 1 lần — bỏ qua auto_bet toggle."""
-    token_id = request.headers.get('X-Session-Token')
-    if not token_id or token_id not in USER_SESSIONS:
-        return jsonify({"error": "unauthorized"}), 401
-
-    data = request.json or {}
-    side = data.get("side", "").upper()
-    amount = int(data.get("amount", 0))
-
-    if side not in ["TAI", "XIU"] or amount < 1000:
-        return jsonify({"error": "invalid params"}), 400
-
-    with SESSION_LOCK:
-        if token_id not in USER_SESSIONS:
-            return jsonify({"error": "session expired"}), 401
-        session = USER_SESSIONS[token_id]
-        sio = session.get("sio")
-        if not sio or not session["game_connected"]:
-            return jsonify({"error": "socket chưa kết nối"}), 400
-        if session["has_bet_this_session"]:
-            return jsonify({"error": "đã cược phiên này rồi"}), 400
-
-        try:
-            sio.emit('bet', {"type": side, "amount": amount}, namespace='/txmd5')
-            session["has_bet_this_session"] = True
-            session["waiting_for_result"] = True
-            session["current_prediction"] = side
-            session["current_bet"] = amount
-            add_log(token_id, f"🎯 MANUAL BET: {amount:,} → {side}")
-            return jsonify({"ok": True})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-
-@app.route('/api/logout', methods=['POST'])
-def api_logout():
-    token_id = request.headers.get('X-Session-Token')
-    with SESSION_LOCK:
-        if token_id and token_id in USER_SESSIONS:
-            session = USER_SESSIONS[token_id]
-            username = session["username"]
-            try:
-                if session.get("sio"):
-                    session["sio"].disconnect()
-            except:
-                pass
-            del USER_SESSIONS[token_id]
-            if USERNAME_TO_TOKEN.get(username) == token_id:
-                del USERNAME_TO_TOKEN[username]
-    return jsonify({"ok": True})
-
-
-# ==========================================
-# HTML TEMPLATE VIP V4
-# ==========================================
+# ==========================================================
+# HTML TEMPLATE — Dashboard only (no login)
+# ==========================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-<meta name="format-detection" content="telephone=no" />
-<title>AUTO CƯỢC LC79 VIP — HuyDaiXuVN</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>AUTO CƯỢC LC79 — Live Monitor</title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
   *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-  html,body{touch-action:manipulation;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;overscroll-behavior:none;height:100%}
   :root{
-    --primary:#e63946;--primary-2:#ff4d6d;--primary-dark:#b5172a;--accent:#ffb703;--gold:#f4b400;
-    --ink:#0d1117;--muted:#6b7280;--line:#e5e7eb;--bg:#f6f7fb;--success:#10b981;--danger:#ef4444;
-    --shadow-md:0 8px 24px rgba(15,23,42,0.06);--shadow-lg:0 20px 60px rgba(15,23,42,0.08);
+    --primary:#e63946;--primary-2:#ff4d6d;--primary-dark:#b5172a;
+    --gold:#f4b400;--accent:#ffb703;--ink:#0d1117;--muted:#6b7280;
+    --line:#e5e7eb;--bg:#f6f7fb;--success:#10b981;--danger:#ef4444;
+    --shadow-md:0 8px 24px rgba(15,23,42,.06);
   }
-  body{font-family:'Plus Jakarta Sans',sans-serif;background:var(--bg);color:#1f2937;display:flex;flex-direction:column;min-height:100vh;-webkit-font-smoothing:antialiased;user-select:none}
-  input,textarea{user-select:text}
-  .header{background:rgba(255,255,255,0.9);backdrop-filter:saturate(180%) blur(14px);border-bottom:1px solid rgba(15,23,42,0.06);position:sticky;top:0;z-index:100}
-  .header-inner{max-width:1280px;margin:0 auto;padding:12px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+  body{font-family:'Plus Jakarta Sans',sans-serif;background:var(--bg);color:#1f2937;min-height:100vh;line-height:1.5;-webkit-font-smoothing:antialiased;display:flex;flex-direction:column}
+  code{user-select:text;-webkit-user-select:text}
+  .header{background:rgba(255,255,255,.92);backdrop-filter:blur(14px);border-bottom:1px solid rgba(15,23,42,.06);position:sticky;top:0;z-index:100}
+  .header-inner{max-width:1100px;margin:0 auto;padding:12px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
   .brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink)}
-  .brand-mark{width:40px;height:40px;border-radius:11px;background:radial-gradient(circle at 30% 30%,#ff9a9e 0%,transparent 55%),linear-gradient(135deg,var(--primary-2),var(--primary-dark));display:grid;place-items:center;color:#fff;font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:12px;box-shadow:0 6px 16px rgba(230,57,70,0.35)}
-  .brand-name strong{font-family:'Space Grotesk',sans-serif;font-size:14px;color:var(--ink)}
+  .brand-mark{width:40px;height:40px;border-radius:11px;background:linear-gradient(135deg,var(--primary-2),var(--primary-dark));display:grid;place-items:center;color:#fff;font-family:'Space Grotesk';font-weight:700;font-size:12px;box-shadow:0 6px 16px rgba(230,57,70,.35)}
+  .brand-name{display:flex;flex-direction:column;line-height:1.15}
+  .brand-name strong{font-family:'Space Grotesk';font-size:14px;font-weight:700;color:var(--ink)}
   .brand-name small{font-size:10px;letter-spacing:1.8px;color:var(--muted);text-transform:uppercase;font-weight:600}
-  .header-right{display:flex;align-items:center;gap:10px}
-  .user-chip{display:flex;align-items:center;gap:8px;padding:5px 12px 5px 5px;background:#fff;border:1px solid var(--line);border-radius:999px;font-size:13px;font-weight:600;color:var(--ink);max-width:200px}
-  .user-chip .avatar{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,var(--primary-2),var(--primary-dark));color:#fff;display:grid;place-items:center;font-size:11px;font-weight:700;text-transform:uppercase;flex-shrink:0}
-  .btn-logout{padding:8px 14px;background:#fef2f2;color:var(--primary);border:1px solid #fecaca;border-radius:9px;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.2s}
-  .btn-logout:hover{background:#fee2e2}
+  .status-pill{display:inline-flex;align-items:center;gap:7px;padding:6px 13px;border-radius:999px;background:#fff;border:1px solid var(--line);font-size:12px;font-weight:600;color:var(--ink)}
+  .status-dot{width:9px;height:9px;border-radius:50%;background:#9ca3af;box-shadow:0 0 0 3px rgba(0,0,0,.08);transition:.2s}
+  .status-dot.live{background:#10b981;box-shadow:0 0 0 3px rgba(16,185,129,.28);animation:pulse 1.5s infinite}
+  .status-dot.off{background:#ef4444;box-shadow:0 0 0 3px rgba(239,68,68,.28)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 
-  .main{flex:1;display:grid;grid-template-columns:1fr 1fr;max-width:1180px;width:100%;margin:0 auto;padding:24px 20px;gap:32px;align-items:center}
-  .brand-panel{position:relative;min-height:560px;border-radius:22px;padding:40px 36px;color:#fff;background:radial-gradient(circle at 20% 10%,rgba(255,183,3,0.18) 0%,transparent 40%),radial-gradient(circle at 90% 90%,rgba(255,77,109,0.25) 0%,transparent 45%),linear-gradient(150deg,#1a1f2e 0%,#0d1117 60%,#1a0a10 100%);overflow:hidden;display:flex;flex-direction:column;justify-content:space-between;box-shadow:var(--shadow-lg);isolation:isolate}
-  .brand-panel::before{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,0.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.035) 1px,transparent 1px);background-size:40px 40px;mask-image:radial-gradient(ellipse at 50% 0%,#000 30%,transparent 75%)}
-  .brand-panel > *{position:relative;z-index:1}
-  .badge-new{display:inline-flex;align-items:center;gap:7px;padding:5px 11px 5px 7px;border-radius:999px;font-size:11px;font-weight:600;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);width:fit-content}
-  .badge-new .dot{width:6px;height:6px;border-radius:50%;background:var(--success);box-shadow:0 0 0 3px rgba(16,185,129,0.25);animation:pulse 2s infinite}
-  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(0.85)}}
-  .brand-panel h1{font-family:'Space Grotesk',sans-serif;font-size:clamp(24px,3vw,36px);line-height:1.18;font-weight:700;letter-spacing:-0.7px;margin:18px 0 12px;max-width:440px}
-  .brand-panel h1 .grad{background:linear-gradient(120deg,#ff4d6d 0%,#ffb703 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-  .brand-panel p.lead{font-size:14.5px;line-height:1.7;color:rgba(255,255,255,0.65);max-width:400px}
-  .feature-list{display:grid;gap:10px;margin-top:24px}
-  .feature-item{display:flex;align-items:center;gap:12px;padding:10px 14px;border-radius:11px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06)}
-  .feature-icon{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,rgba(255,77,109,0.25),rgba(255,183,3,0.2));display:grid;place-items:center;flex-shrink:0;color:#ffb703}
-  .feature-item strong{display:block;font-size:13px;font-weight:600;color:#fff;margin-bottom:1px}
-  .feature-item small{font-size:11.5px;color:rgba(255,255,255,0.5)}
+  .dash{flex:1;max-width:1100px;width:100%;margin:0 auto;padding:20px;display:flex;flex-direction:column;gap:14px}
 
-  .login-panel{display:flex;justify-content:center;align-items:center}
-  .login-card{width:100%;max-width:420px;background:#fff;border-radius:18px;padding:36px 30px 32px;border:1px solid var(--line);box-shadow:var(--shadow-md)}
-  .login-card h2{font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:700;color:var(--ink);margin-bottom:5px}
-  .login-card .subtitle{font-size:13.5px;color:var(--muted);margin-bottom:24px}
-  .alert{display:none;align-items:flex-start;gap:9px;padding:11px 13px;border-radius:10px;font-size:13px;margin-bottom:16px}
-  .alert.show{display:flex}
-  .alert.error{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c}
-  .field{margin-bottom:16px}
-  .field label{display:block;font-size:12.5px;font-weight:600;color:#374151;margin-bottom:6px}
-  .input-box{position:relative}
-  .input-box .lead{position:absolute;left:13px;top:50%;transform:translateY(-50%);width:17px;height:17px;color:#9ca3af;pointer-events:none}
-  .input-box input{width:100%;padding:12px 42px 12px 40px;font-size:14px;font-family:inherit;color:var(--ink);background:#fff;border:1.5px solid #e5e7eb;border-radius:10px;outline:none;transition:all 0.2s;font-weight:500}
-  .input-box input:focus{border-color:var(--primary);box-shadow:0 0 0 4px rgba(230,57,70,0.1)}
-  .btn-eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:30px;height:30px;border-radius:7px;border:none;background:transparent;color:#9ca3af;cursor:pointer;display:grid;place-items:center}
-  .btn-eye:hover{color:var(--primary);background:#fef2f2}
-  .remember{display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:#4b5563;margin-bottom:20px;user-select:none}
-  .remember input{position:absolute;opacity:0;pointer-events:none}
-  .remember .box{width:17px;height:17px;border-radius:4px;border:1.5px solid #d1d5db;display:grid;place-items:center;transition:all 0.2s;background:#fff}
-  .remember .box svg{width:10px;height:10px;color:#fff;opacity:0;transform:scale(0.6);transition:all 0.2s}
-  .remember input:checked + .box{background:var(--primary);border-color:var(--primary)}
-  .remember input:checked + .box svg{opacity:1;transform:scale(1)}
-  .btn-submit{width:100%;padding:13px;font-size:14.5px;font-weight:600;font-family:inherit;color:#fff;background:linear-gradient(135deg,var(--primary-2),var(--primary-dark));border:none;border-radius:10px;cursor:pointer;transition:all 0.25s;box-shadow:0 5px 16px rgba(230,57,70,0.32);display:flex;align-items:center;justify-content:center;gap:8px}
-  .btn-submit:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 8px 22px rgba(230,57,70,0.42)}
-  .btn-submit:disabled{cursor:not-allowed;opacity:0.9}
-  .spinner{width:15px;height:15px;border:2px solid rgba(255,255,255,0.35);border-top-color:#fff;border-radius:50%;animation:spin 0.7s linear infinite;display:none}
-  .btn-submit.loading .spinner{display:block}
-  @keyframes spin{to{transform:rotate(360deg)}}
+  .welcome-card{background:linear-gradient(135deg,var(--primary-2),var(--primary-dark));color:#fff;padding:22px 24px;border-radius:18px;display:flex;align-items:center;gap:16px;box-shadow:0 10px 26px rgba(230,57,70,.28);position:relative;overflow:hidden}
+  .welcome-card::after{content:'';position:absolute;width:220px;height:220px;border-radius:50%;background:rgba(255,255,255,.15);top:-90px;right:-70px}
+  .welcome-avatar{width:56px;height:56px;border-radius:14px;background:rgba(255,255,255,.22);display:grid;place-items:center;font-size:22px;font-weight:800;font-family:'Space Grotesk';border:2px solid rgba(255,255,255,.3);text-transform:uppercase;flex-shrink:0;position:relative;z-index:1}
+  .welcome-info{position:relative;z-index:1;flex:1;min-width:0}
+  .welcome-info .greet{font-size:12px;opacity:.85;margin-bottom:1px}
+  .welcome-info h2{font-family:'Space Grotesk';font-size:19px;font-weight:700;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .level-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;background:linear-gradient(135deg,#ffb703,#ff8c00);border-radius:999px;font-size:11px;font-weight:700;color:#1a1f2e;text-transform:uppercase;letter-spacing:.5px}
 
-  /* DASHBOARD */
-  .dash{flex:1;max-width:1000px;width:100%;margin:0 auto;padding:20px;display:flex;flex-direction:column;gap:16px}
-  .welcome-card{background:linear-gradient(135deg,var(--primary-2),var(--primary-dark));color:#fff;padding:24px 26px;border-radius:18px;display:flex;align-items:center;gap:16px;box-shadow:0 10px 26px rgba(230,57,70,0.28);position:relative;overflow:hidden}
-  .welcome-card::after{content:'';position:absolute;width:220px;height:220px;border-radius:50%;background:rgba(255,255,255,0.15);top:-90px;right:-70px}
-  .welcome-avatar{width:62px;height:62px;border-radius:16px;background:rgba(255,255,255,0.22);display:grid;place-items:center;font-size:24px;font-weight:800;font-family:'Space Grotesk',sans-serif;border:2px solid rgba(255,255,255,0.3);flex-shrink:0;position:relative;z-index:1;text-transform:uppercase}
-  .welcome-info{position:relative;z-index:1;min-width:0;flex:1}
-  .welcome-info .greet{font-size:12px;opacity:0.85;margin-bottom:1px;font-weight:500}
-  .welcome-info h2{font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .level-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;background:linear-gradient(135deg,#ffb703,#ff8c00);border-radius:999px;font-size:11px;font-weight:700;color:#1a1f2e;text-transform:uppercase;letter-spacing:0.5px;margin-right:6px}
-  .connection-status{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:600}
-  .connection-status.connected{background:rgba(16,185,129,0.2);color:#a7f3d0}
-  .connection-status.disconnected{background:rgba(239,68,68,0.2);color:#fecaca}
-  .connection-status .dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 1.5s infinite}
+  .card{background:#fff;border-radius:16px;padding:18px 20px;border:1px solid var(--line);box-shadow:var(--shadow-md)}
+  .card h3{font-family:'Space Grotesk';font-size:14px;font-weight:700;color:var(--ink);margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .card h3 .badge{margin-left:auto;font-size:10.5px;font-weight:700;color:var(--muted);background:#f3f4f6;padding:2px 8px;border-radius:6px;letter-spacing:.3px}
 
-  .stats-grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
-  .stat-card{background:#fff;border-radius:16px;padding:18px 18px 16px;border:1px solid var(--line);box-shadow:var(--shadow-md);border-left:4px solid var(--primary);position:relative;transition:transform 0.2s}
-  .stat-card.win{border-left-color:var(--success)}
-  .stat-card.loss{border-left-color:var(--danger)}
+  .stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  .stat-card{background:#fff;border-radius:14px;padding:16px;border:1px solid var(--line);box-shadow:var(--shadow-md);border-left:4px solid var(--primary)}
   .stat-card.gold{border-left-color:var(--gold)}
-  .stat-label{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px}
-  .stat-value{font-family:'Space Grotesk',sans-serif;font-size:clamp(20px,2.5vw,26px);font-weight:700;color:var(--ink);letter-spacing:-0.5px;display:flex;align-items:center;gap:6px;word-break:break-all}
-  .stat-value.win{color:var(--success)}
-  .stat-value.loss{color:var(--danger)}
-  .stat-unit{font-size:11px;font-weight:600;color:var(--muted);margin-left:2px}
+  .stat-card.green{border-left-color:var(--success)}
+  .stat-label{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
+  .stat-value{font-family:'Space Grotesk';font-size:26px;font-weight:700;color:var(--ink);letter-spacing:-.5px;word-break:break-all}
+  .stat-value.pos{color:var(--success)}
+  .stat-value.neg{color:var(--danger)}
 
-  .prediction-panel{background:linear-gradient(135deg,#1a1f2e 0%,#2d1b2e 100%);color:#fff;border-radius:18px;padding:26px;position:relative;overflow:hidden}
-  .prediction-panel::after{content:'';position:absolute;width:280px;height:280px;border-radius:50%;background:radial-gradient(circle,rgba(255,183,3,0.15),transparent 70%);top:-100px;right:-100px}
-  .pred-session{font-size:12px;opacity:0.7;margin-bottom:8px;font-family:'Space Grotesk',sans-serif;letter-spacing:0.5px;position:relative;z-index:1}
-  .pred-value{font-size:48px;font-weight:800;font-family:'Space Grotesk',sans-serif;letter-spacing:-1.5px;position:relative;z-index:1;transition:all 0.5s ease;line-height:1.1}
-  .pred-value.tai{color:#4dabf7;text-shadow:0 0 24px rgba(77,171,247,0.55),0 0 48px rgba(77,171,247,0.25);animation:glowTai 2s infinite alternate}
-  .pred-value.xiu{color:#ff6b6b;text-shadow:0 0 24px rgba(255,107,107,0.55),0 0 48px rgba(255,107,107,0.25);animation:glowXiu 2s infinite alternate}
-  .pred-value.unknown{color:#9ca3af;font-size:22px;letter-spacing:0}
-  @keyframes glowTai{from{filter:brightness(1)}to{filter:brightness(1.25)}}
-  @keyframes glowXiu{from{filter:brightness(1)}to{filter:brightness(1.25)}}
-  .pred-result-line{margin-top:10px;font-size:13px;opacity:0.75;position:relative;z-index:1}
-  .pred-result-line b{font-weight:700;color:#ffb703}
-  .history-strip{display:flex;flex-wrap:wrap;gap:6px;margin-top:16px;position:relative;z-index:1;max-height:110px;overflow-y:auto;padding:2px}
-  .history-chip{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;font-size:13px;font-weight:800;font-family:'Space Grotesk',sans-serif;flex-shrink:0;animation:popIn 0.3s ease}
-  .history-chip.tai{background:rgba(77,171,247,0.2);color:#4dabf7;border:1px solid rgba(77,171,247,0.4)}
-  .history-chip.xiu{background:rgba(255,107,107,0.2);color:#ff6b6b;border:1px solid rgba(255,107,107,0.4)}
-  @keyframes popIn{from{transform:scale(0);opacity:0}to{transform:scale(1);opacity:1}}
+  /* SESSION LIVE */
+  .session-card{background:linear-gradient(135deg,#1a1f2e,#0d1117);color:#fff;border-radius:18px;padding:22px 24px;box-shadow:0 12px 30px rgba(0,0,0,.18);border:1px solid rgba(255,255,255,.06);position:relative;overflow:hidden}
+  .session-card::before{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.03) 1px,transparent 1px);background-size:32px 32px;mask-image:radial-gradient(ellipse at 50% 0%,#000 30%,transparent 75%);-webkit-mask-image:radial-gradient(ellipse at 50% 0%,#000 30%,transparent 75%)}
+  .session-card>*{position:relative;z-index:1}
+  .session-head{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+  .session-id{font-family:'Space Grotesk';font-size:22px;font-weight:800;letter-spacing:-.5px}
+  .session-tag{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;padding:4px 10px;border-radius:6px;background:rgba(255,255,255,.1);color:#a8b3d0}
+  .session-tag.betting{background:rgba(16,185,129,.15);color:#34d399}
+  .session-tag.dealing{background:rgba(245,158,11,.15);color:#fbbf24}
 
-  .card{background:#fff;border-radius:16px;padding:22px;border:1px solid var(--line);box-shadow:var(--shadow-md)}
-  .card h3{font-family:'Space Grotesk',sans-serif;font-size:15px;font-weight:700;color:var(--ink);margin-bottom:16px;display:flex;align-items:center;gap:8px;justify-content:space-between}
-  .card h3 .left{display:flex;align-items:center;gap:8px}
+  .pred-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:center}
+  @media(max-width:640px){.pred-row{grid-template-columns:1fr}}
+  .pred-main{text-align:center;padding:16px 12px;border-radius:12px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08)}
+  .pred-label{font-size:11px;letter-spacing:1.5px;color:#8b949e;text-transform:uppercase;font-weight:700;margin-bottom:6px}
+  .pred-big{font-family:'Space Grotesk';font-size:42px;font-weight:800;letter-spacing:-1px;line-height:1}
+  .pred-big.tai{color:#60a5fa}
+  .pred-big.xiu{color:#f87171}
+  .pred-big.empty{color:#4b5563;font-size:18px;font-weight:500;letter-spacing:0}
+  .pred-sub{font-size:11.5px;color:#8b949e;margin-top:6px}
 
-  .bg-status{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:600;background:#f0f2f5;color:var(--muted)}
-  .bg-status.on{background:#ecfdf5;color:#047857}
-  .bg-status .dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 1.5s infinite}
+  .result-main{text-align:center;padding:16px 12px;border-radius:12px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08)}
+  .result-big{font-family:'Space Grotesk';font-size:36px;font-weight:800;letter-spacing:-1px;line-height:1}
+  .result-big.tai{color:#60a5fa}
+  .result-big.xiu{color:#f87171}
+  .result-big.empty{color:#4b5563;font-size:16px;font-weight:500}
+  .dices{font-family:'Consolas',monospace;font-size:13px;color:#c9d1d9;margin-top:6px}
+  .result-mark{font-size:11.5px;font-weight:700;margin-top:6px}
+  .result-mark.ok{color:#34d399}
+  .result-mark.fail{color:#f87171}
+  .result-mark.none{color:#8b949e}
 
-  .setting-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 0;border-bottom:1px solid #f0f2f5;flex-wrap:wrap}
-  .setting-row:last-child{border-bottom:none}
-  .setting-row .info{flex:1;min-width:200px}
-  .setting-row label{font-size:14px;font-weight:600;color:var(--ink);display:block}
-  .setting-row small{display:block;font-size:11.5px;color:var(--muted);font-weight:400;margin-top:3px;line-height:1.4}
-  .setting-input{width:150px;padding:10px 12px;border:1.5px solid var(--line);border-radius:8px;font-size:14px;font-weight:600;text-align:right;font-family:'Space Grotesk',sans-serif;transition:border 0.15s}
-  .setting-input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(230,57,70,0.08)}
+  /* HISTORY */
+  .recent-10{display:grid;grid-template-columns:repeat(10,1fr);gap:8px}
+  @media(max-width:720px){.recent-10{grid-template-columns:repeat(5,1fr)}}
+  .hist-big{aspect-ratio:1;display:grid;place-items:center;border-radius:10px;font-family:'Space Grotesk';font-weight:800;font-size:18px;color:#fff;letter-spacing:-.5px;box-shadow:0 3px 8px rgba(0,0,0,.08)}
+  .hist-big.tai{background:linear-gradient(135deg,#3b82f6,#1d4ed8)}
+  .hist-big.xiu{background:linear-gradient(135deg,#ef4444,#b91c1c)}
+  .hist-big.empty{background:#f3f4f6;color:#d1d5db;font-size:13px}
 
-  /* Toggle switch — FIX: pointer-events + z-index */
-  .toggle-switch{position:relative;width:52px;height:28px;background:#e5e7eb;border-radius:999px;cursor:pointer;transition:background 0.25s;border:none;padding:0;flex-shrink:0;pointer-events:auto;z-index:1;outline:none}
-  .toggle-switch::after{content:'';position:absolute;top:3px;left:3px;width:22px;height:22px;background:#fff;border-radius:50%;box-shadow:0 2px 4px rgba(0,0,0,0.2);transition:transform 0.25s cubic-bezier(0.4,0,0.2,1)}
-  .toggle-switch.on{background:linear-gradient(135deg,var(--primary-2),var(--primary-dark));box-shadow:0 0 0 3px rgba(230,57,70,0.15)}
-  .toggle-switch.on::after{transform:translateX(24px)}
-  .toggle-switch:active::after{width:26px}
-  .toggle-switch.on:active::after{transform:translateX(20px)}
+  .history-grid{display:flex;flex-wrap:wrap;gap:5px}
+  .hist-chip{min-width:34px;text-align:center;padding:5px 7px;border-radius:7px;font-size:11px;font-weight:700;color:#fff;font-family:'Space Grotesk'}
+  .hist-chip.tai{background:linear-gradient(135deg,#3b82f6,#1d4ed8)}
+  .hist-chip.xiu{background:linear-gradient(135deg,#ef4444,#b91c1c)}
+  .hist-empty{font-size:12px;color:var(--muted);font-style:italic}
 
-  .weights-list{display:grid;gap:6px}
-  .weight-row{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:8px;background:#f8f9fb;font-size:13px}
-  .weight-name{flex:0 0 130px;color:var(--ink);font-weight:600;font-family:'Space Grotesk',sans-serif;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .weight-bar{flex:1;height:6px;background:#e5e7eb;border-radius:999px;overflow:hidden;min-width:40px}
-  .weight-bar-fill{height:100%;background:linear-gradient(90deg,var(--primary-2),var(--accent));border-radius:999px;transition:width 0.4s ease}
-  .weight-value{font-size:12px;color:var(--primary);font-weight:700;min-width:42px;text-align:right;font-family:'Space Grotesk',sans-serif}
+  .log-list{font-family:'Consolas',monospace;font-size:11.5px;background:#0d1117;color:#c9d1d9;padding:12px 14px;border-radius:10px;max-height:240px;overflow-y:auto;line-height:1.65;word-break:break-word}
+  .log-list .t{color:#6e7681}
+  .log-list .ok{color:#7ee787}
+  .log-list .fail{color:#ff7b72}
 
-  .log-list{display:grid;gap:4px;max-height:340px;overflow-y:auto;font-family:'Consolas','Monaco',monospace;font-size:12px}
-  .log-item{padding:7px 10px;border-radius:6px;background:#f8f9fb;display:flex;gap:10px;border-left:2px solid #e5e7eb;animation:slideIn 0.25s ease}
-  .log-item.win{background:#ecfdf5;border-left-color:var(--success)}
-  .log-item.loss{background:#fef2f2;border-left-color:var(--danger)}
-  .log-item.bet{background:#eff6ff;border-left-color:#3b82f6}
-  .log-time{color:var(--muted);flex-shrink:0;font-weight:600}
-  .log-msg{color:#1f2937;word-break:break-word}
-  @keyframes slideIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
+  .footer{background:#fff;border-top:1px solid var(--line);padding:16px 20px;text-align:center;font-size:12px;color:var(--muted);margin-top:auto}
+  .footer b{background:linear-gradient(135deg,var(--primary-2),var(--primary-dark));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;font-weight:700}
 
-  .x2-badge{display:inline-block;padding:2px 7px;border-radius:5px;background:linear-gradient(135deg,#ffb703,#ff8c00);color:#1a1f2e;font-size:10px;font-weight:800;margin-left:6px;letter-spacing:0.5px;animation:pulse 1s infinite}
+  .loading-overlay{position:fixed;inset:0;background:rgba(246,247,251,.94);display:grid;place-items:center;z-index:999;transition:opacity .3s;backdrop-filter:blur(4px)}
+  .loading-overlay.hidden{opacity:0;pointer-events:none}
+  .loading-box{background:#fff;padding:32px 40px;border-radius:18px;box-shadow:var(--shadow-md);text-align:center;max-width:360px}
+  .loading-spin{width:44px;height:44px;border:4px solid #f3f4f6;border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 16px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .loading-box h3{font-family:'Space Grotesk';font-size:16px;font-weight:700;color:var(--ink);margin-bottom:6px}
+  .loading-box p{font-size:13px;color:var(--muted);line-height:1.6}
 
-  .manual-bet-bar{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
-  .manual-btn{flex:1;min-width:100px;padding:11px 14px;border:none;border-radius:10px;font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;transition:all 0.2s;display:flex;align-items:center;justify-content:center;gap:6px}
-  .manual-btn.tai{background:linear-gradient(135deg,#4dabf7,#1e88e5);color:#fff;box-shadow:0 4px 12px rgba(30,136,229,0.3)}
-  .manual-btn.xiu{background:linear-gradient(135deg,#ff6b6b,#e63946);color:#fff;box-shadow:0 4px 12px rgba(230,57,70,0.3)}
-  .manual-btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 6px 16px rgba(0,0,0,0.2)}
-  .manual-btn:disabled{opacity:0.5;cursor:not-allowed}
-
-  .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);padding:12px 20px;border-radius:10px;color:#fff;font-size:13px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.2);z-index:999;transition:transform 0.3s ease;max-width:90%}
-  .toast.show{transform:translateX(-50%) translateY(0)}
-  .toast.success{background:linear-gradient(135deg,#10b981,#059669)}
-  .toast.error{background:linear-gradient(135deg,#ef4444,#dc2626)}
-  .toast.info{background:linear-gradient(135deg,#3b82f6,#2563eb)}
-
-  .footer{background:#fff;border-top:1px solid var(--line);padding:18px 20px;margin-top:auto}
-  .footer-inner{max-width:1280px;margin:0 auto;text-align:center}
-  .copyright{font-size:12.5px;color:var(--muted)}
-  .copyright b{background:linear-gradient(135deg,var(--primary-2),var(--primary-dark));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;font-weight:700}
-
-  @media (max-width:900px){
-    .main{grid-template-columns:1fr;padding:18px 16px;gap:20px}
-    .brand-panel{min-height:auto;padding:28px 24px;border-radius:16px}
-    .feature-list{display:none}
-    .brand-panel h1{font-size:22px;margin:14px 0 10px}
-    .stats-grid-4{grid-template-columns:repeat(2,1fr)}
-    .pred-value{font-size:36px}
-  }
-  @media (max-width:720px){
-    .welcome-card{padding:20px;gap:14px}
-    .welcome-avatar{width:52px;height:52px;font-size:20px}
-    .welcome-info h2{font-size:17px}
-    .login-card{padding:30px 22px 26px}
-    .login-card h2{font-size:20px}
-  }
-  @media (max-width:480px){
-    .header-inner{padding:10px 14px}
-    .user-chip span{display:none}
+  @media(max-width:720px){
+    .stats-grid{grid-template-columns:1fr}
+    .welcome-avatar{width:48px;height:48px;font-size:19px}
+    .welcome-info h2{font-size:16px}
+    .session-id{font-size:18px}
+    .pred-big{font-size:34px}
+    .result-big{font-size:28px}
     .dash{padding:14px;gap:12px}
-    .stat-card{padding:14px 16px}
-    .stat-value{font-size:20px}
-    .stats-grid-4{grid-template-columns:1fr}
-    .pred-value{font-size:32px}
-    .setting-row{flex-direction:column;align-items:flex-start}
-    .setting-input{width:100%}
-    .weight-name{flex:0 0 90px}
+    .stat-value{font-size:22px}
   }
 </style>
 </head>
 <body>
 
-<!-- LOGIN VIEW -->
-<div id="loginView">
-  <header class="header">
-    <div class="header-inner">
-      <a href="#" class="brand">
-        <div class="brand-mark">LC79</div>
-        <div class="brand-name"><strong>AUTO CƯỢC LC79 VIP</strong><small>35 AI Cores • Real Bet</small></div>
-      </a>
-    </div>
-  </header>
-  <main class="main">
-    <section class="brand-panel">
-      <div>
-        <div class="badge-new"><span class="dot"></span>Background AI đang thu thập dữ liệu 24/7</div>
-        <h1>Đăng nhập để bước vào<br><span class="grad">kỷ nguyên tự động hóa</span></h1>
-        <p class="lead">Dự đoán Tài Xỉu bằng 35 lõi AI thích ứng — tự động vào tiền REAL, nhân đôi khi thắng, chốt lãi thông minh, quản lý vốn chuyên nghiệp.</p>
-        <div class="feature-list">
-          <div class="feature-item">
-            <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
-            <div><strong>Hash MD5 Server-Side</strong><small>Bảo mật như bot chuẩn</small></div>
-          </div>
-          <div class="feature-item">
-            <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
-            <div><strong>35 lõi AI + Exponential Weighting</strong><small>Tự học, tự thích ứng</small></div>
-          </div>
-          <div class="feature-item">
-            <div class="feature-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div>
-            <div><strong>Auto Cược + X2 + Chốt lãi</strong><small>REAL betting qua WSS</small></div>
-          </div>
-        </div>
-      </div>
-    </section>
-    <section class="login-panel">
-      <div class="login-card">
-        <h2>Chào mừng trở lại 👋</h2>
-        <p class="subtitle">Đăng nhập tài khoản để tiếp tục</p>
-        <div class="alert error" id="alertBox">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-          <span id="alertText"></span>
-        </div>
-        <form id="loginForm" autocomplete="off" novalidate>
-          <div class="field">
-            <label for="username">Tên đăng nhập</label>
-            <div class="input-box">
-              <input type="text" id="username" placeholder="Nhập tên đăng nhập" required />
-              <svg class="lead" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-            </div>
-          </div>
-          <div class="field">
-            <label for="password">Mật khẩu</label>
-            <div class="input-box">
-              <input type="password" id="password" placeholder="Nhập mật khẩu" required />
-              <svg class="lead" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-              <button type="button" class="btn-eye" id="togglePass">
-                <svg id="eyeIcon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-              </button>
-            </div>
-          </div>
-          <label class="remember">
-            <input type="checkbox" id="remember" />
-            <span class="box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>
-            Ghi nhớ đăng nhập
-          </label>
-          <button type="submit" class="btn-submit" id="btnLogin"><span class="spinner"></span><span class="btn-text">Đăng nhập</span></button>
-        </form>
-      </div>
-    </section>
-  </main>
-  <footer class="footer"><div class="footer-inner"><div class="copyright">© 2025 AUTO CƯỢC LC79 — Bản quyền thuộc về <b>HuyDaiXuVN</b></div></div></footer>
+<div class="loading-overlay" id="loadingOverlay">
+  <div class="loading-box">
+    <div class="loading-spin"></div>
+    <h3 id="loadTitle">Đang khởi động collector...</h3>
+    <p id="loadDesc">Backend đang login và kết nối WebSocket để thu thập phiên. Vui lòng đợi ~15-30 giây.</p>
+  </div>
 </div>
 
-<!-- DASHBOARD VIEW -->
-<div id="dashboardView" style="display:none">
-  <header class="header">
-    <div class="header-inner">
-      <a href="#" class="brand">
-        <div class="brand-mark">LC79</div>
-        <div class="brand-name"><strong>AUTO CƯỢC LC79 VIP</strong><small>Dashboard</small></div>
-      </a>
-      <div class="header-right">
-        <div class="user-chip"><div class="avatar" id="userAvatar">U</div><span id="userChipName">User</span></div>
-        <button class="btn-logout" id="btnLogout">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-          Đăng xuất
-        </button>
+<header class="header">
+  <div class="header-inner">
+    <a href="#" class="brand">
+      <div class="brand-mark">LC79</div>
+      <div class="brand-name">
+        <strong>AUTO CƯỢC LC79</strong>
+        <small>Live Session Monitor · 24/7</small>
       </div>
+    </a>
+    <div class="status-pill">
+      <span class="status-dot" id="wsDot"></span>
+      <span id="wsLabel">Đang kết nối...</span>
     </div>
-  </header>
-  <main class="dash">
-    <div class="welcome-card">
-      <div class="welcome-avatar" id="welcomeAvatar">U</div>
-      <div class="welcome-info">
-        <div class="greet">Xin chào, chào mừng trở lại!</div>
-        <h2 id="welcomeName">nickname</h2>
-        <div>
-          <span class="level-badge" id="levelBadge">★ LV.1</span>
-          <span class="connection-status disconnected" id="connStatus"><span class="dot"></span><span id="connText">Đang kết nối...</span></span>
-        </div>
-      </div>
-    </div>
+  </div>
+</header>
 
-    <div class="stats-grid-4">
-      <div class="stat-card">
-        <div class="stat-label">💰 Số dư VIN</div>
-        <div class="stat-value" id="balanceValue">0</div>
+<main class="dash">
+  <div class="welcome-card">
+    <div class="welcome-avatar" id="welcomeAvatar">L</div>
+    <div class="welcome-info">
+      <div class="greet">Phiên thu thập realtime · 35 Core AI</div>
+      <h2 id="welcomeName">Đang chờ dữ liệu...</h2>
+      <span class="level-badge" id="statBadge">ĐANG KHỞI ĐỘNG</span>
+    </div>
+  </div>
+
+  <!-- Session hiện tại -->
+  <div class="session-card">
+    <div class="session-head">
+      <span class="session-id" id="sessId">#—</span>
+      <span class="session-tag" id="sessTag">WAITING</span>
+    </div>
+    <div class="pred-row">
+      <div class="pred-main">
+        <div class="pred-label">🤖 AI DỰ ĐOÁN PHIÊN NÀY</div>
+        <div class="pred-big empty" id="predVal">Chờ đủ 10 phiên</div>
+        <div class="pred-sub" id="predSub">Đang tích lũy dữ liệu...</div>
       </div>
-      <div class="stat-card" id="plCard">
-        <div class="stat-label">📈 Lãi/Lỗ</div>
-        <div class="stat-value" id="plValue">0</div>
-      </div>
-      <div class="stat-card gold">
-        <div class="stat-label">🔥 Chuỗi thắng</div>
-        <div class="stat-value" id="streakValue">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">💵 Cược hiện tại</div>
-        <div class="stat-value"><span id="betValue">0</span><span class="x2-badge" id="x2Badge" style="display:none">X2</span></div>
+      <div class="result-main">
+        <div class="pred-label">🎲 KẾT QUẢ PHIÊN TRƯỚC</div>
+        <div class="result-big empty" id="resultVal">—</div>
+        <div class="dices" id="resultDices">— · — · —</div>
+        <div class="result-mark none" id="resultMark">—</div>
       </div>
     </div>
+  </div>
 
-    <div class="prediction-panel">
-      <div class="pred-session">PHIÊN #<span id="sessionId">—</span></div>
-      <div class="pred-value unknown" id="predValue">Đang chờ dữ liệu...</div>
-      <div class="pred-result-line">Kết quả gần nhất: <b id="lastResult">—</b></div>
-      <div class="history-strip" id="historyStrip"></div>
+  <!-- Stats -->
+  <div class="stats-grid">
+    <div class="stat-card gold">
+      <div class="stat-label">Số dư</div>
+      <div class="stat-value" id="balanceVal">—</div>
     </div>
-
-    <div class="card">
-      <h3>
-        <span class="left">⚙️ Cài đặt Auto Cược</span>
-        <span class="bg-status" id="bgStatus"><span class="dot"></span><span id="bgStatusText">Background: đang tải...</span></span>
-      </h3>
-      <div class="setting-row">
-        <div class="info">
-          <label for="baseBet">Số tiền auto cược mỗi phiên</label>
-          <small>Vốn cơ bản cho mỗi phiên (VIN)</small>
-        </div>
-        <input type="number" class="setting-input" id="baseBet" value="10000" min="1000" step="1000" />
-      </div>
-      <div class="setting-row">
-        <div class="info">
-          <label>Bật/Tắt Auto Cược (REAL)</label>
-          <small>Bot tự đặt cược thật qua WSS khi có tín hiệu AI</small>
-        </div>
-        <button type="button" class="toggle-switch" id="autoBetToggle" aria-label="Auto Bet"></button>
-      </div>
-      <div class="setting-row">
-        <div class="info">
-          <label>X2 — Nhân đôi khi thắng</label>
-          <small>Thắng 1k → cược 2k. Thắng tiếp vẫn 2k (không x4). Thua → reset về 1k.</small>
-        </div>
-        <button type="button" class="toggle-switch" id="x2Toggle" aria-label="X2 Mode"></button>
-      </div>
-      <div class="setting-row">
-        <div class="info">
-          <label for="targetProfit">Target chốt lãi</label>
-          <small>Bot tự tắt khi đạt lợi nhuận. Đặt 0 = tắt.</small>
-        </div>
-        <input type="number" class="setting-input" id="targetProfit" value="0" min="0" step="10000" />
-      </div>
-      <div class="setting-row" style="display:block">
-        <div class="info" style="width:100%;margin-bottom:8px">
-          <label>🎯 Đặt cược thủ công (1 lần)</label>
-          <small>Bỏ qua Auto — chỉ đặt khi bạn muốn</small>
-        </div>
-        <div class="manual-bet-bar">
-          <button type="button" class="manual-btn tai" id="btnManualTai">🔵 ĐẶT TÀI</button>
-          <button type="button" class="manual-btn xiu" id="btnManualXiu">🔴 ĐẶT XỈU</button>
-        </div>
-      </div>
+    <div class="stat-card">
+      <div class="stat-label">Tổng phiên thu thập</div>
+      <div class="stat-value" id="totalHistVal">0</div>
     </div>
-
-    <div class="card">
-      <h3><span class="left">🧠 TOP 10 Lõi AI dẫn đầu</span></h3>
-      <div class="weights-list" id="weightsList"><div style="color:var(--muted);font-size:13px;text-align:center;padding:20px">Đang tải...</div></div>
+    <div class="stat-card green">
+      <div class="stat-label">Độ chính xác AI</div>
+      <div class="stat-value" id="accVal">0%</div>
     </div>
+  </div>
 
-    <div class="card">
-      <h3><span class="left">📋 Nhật ký hoạt động</span></h3>
-      <div class="log-list" id="logList"><div style="color:var(--muted);font-size:13px;text-align:center;padding:20px">Chưa có hoạt động</div></div>
+  <!-- 10 phiên gần nhất -->
+  <div class="card">
+    <h3>🔥 10 phiên gần nhất <span class="badge" id="recent10Badge">0/10</span></h3>
+    <div class="recent-10" id="recent10"></div>
+  </div>
+
+  <!-- Toàn bộ history -->
+  <div class="card">
+    <h3>📜 Lịch sử 50 phiên <span class="badge" id="histBadge">0</span></h3>
+    <div class="history-grid" id="historyGrid"><span class="hist-empty">Chưa có dữ liệu</span></div>
+  </div>
+
+  <!-- AI Cores top -->
+  <div class="card">
+    <h3>🧠 Top Core AI đang dẫn đầu</h3>
+    <div class="history-grid" id="coresGrid" style="gap:8px">
+      <span class="hist-empty">Đang tính toán...</span>
     </div>
-  </main>
-  <footer class="footer"><div class="footer-inner"><div class="copyright">© 2025 AUTO CƯỢC LC79 — Bản quyền thuộc về <b>HuyDaiXuVN</b></div></div></footer>
-</div>
+  </div>
 
-<div class="toast" id="toast"></div>
+  <!-- Logs -->
+  <div class="card">
+    <h3>📡 Log WebSocket</h3>
+    <div class="log-list" id="logList">Đang chờ sự kiện...</div>
+  </div>
+</main>
+
+<footer class="footer">© 2025 AUTO CƯỢC LC79 — <b>HuyDaiXuVN</b> · Collector chạy nền 24/7</footer>
 
 <script>
 const $ = id => document.getElementById(id);
-let SERVER_TOKEN = null;
-let POLL_TIMER = null;
-const PENDING = {};  // Pending settings — tránh race condition
+const API_STATE = '/api/state';
+let pollTimer = null;
+let loadingHidden = false;
 
-/* ============================================================
-   🔒 CHỐNG ZOOM TRIỆT ĐỂ
-   ============================================================ */
-let lastTouch = 0;
-document.addEventListener('touchend', (e) => {
-  const now = Date.now();
-  if (now - lastTouch <= 300) e.preventDefault();
-  lastTouch = now;
-}, { passive: false });
-
-document.addEventListener('touchmove', (e) => {
-  if (e.touches.length > 1) e.preventDefault();
-}, { passive: false });
-
-['gesturestart','gesturechange','gestureend'].forEach(ev => {
-  document.addEventListener(ev, e => e.preventDefault(), { passive: false });
-});
-
-document.addEventListener('wheel', (e) => {
-  if (e.ctrlKey) e.preventDefault();
-}, { passive: false });
-
-document.addEventListener('keydown', (e) => {
-  if ((e.ctrlKey || e.metaKey) && ['+','-','=','0'].includes(e.key)) {
-    e.preventDefault();
-  }
-});
-
-// Prevent double-click zoom on elements
-document.addEventListener('dblclick', (e) => e.preventDefault(), { passive: false });
-
-/* ============================================================
-   HELPERS
-   ============================================================ */
-function fmt(v){
-  if(v===null||v===undefined||v==='') return '0';
-  const n = Number(v);
-  if(isNaN(n)) return String(v);
-  return new Intl.NumberFormat('vi-VN').format(n);
+function fmt(n){
+  const num = Number(n) || 0;
+  return new Intl.NumberFormat('vi-VN').format(num);
 }
-function escapeHtml(s){
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-function showError(msg){ $('alertText').textContent = msg; $('alertBox').classList.add('show'); }
-function hideError(){ $('alertBox').classList.remove('show'); }
-function toast(msg, type='info'){
-  const t = $('toast');
-  t.className = 'toast show ' + type;
-  t.textContent = msg;
-  clearTimeout(window._toastTimer);
-  window._toastTimer = setTimeout(()=>{ t.classList.remove('show'); }, 2500);
-}
-function setPending(key, ms=2000){
-  PENDING[key] = Date.now() + ms;
-}
-function isPending(key){
-  return PENDING[key] && Date.now() < PENDING[key];
+function esc(s){ return String(s).replace(/[&<>"']/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+
+function hideLoading(){
+  if (loadingHidden) return;
+  loadingHidden = true;
+  const el = $('loadingOverlay');
+  el.classList.add('hidden');
+  setTimeout(() => el.remove(), 400);
 }
 
-/* ============================================================
-   TOGGLE MẬT KHẨU
-   ============================================================ */
-const eyeOpen = `<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>`;
-const eyeClosed = `<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>`;
-$('togglePass').addEventListener('click', ()=>{
-  const pw = $('password');
-  const show = pw.type === 'password';
-  pw.type = show ? 'text' : 'password';
-  $('eyeIcon').innerHTML = show ? eyeClosed : eyeOpen;
-});
-
-/* ============================================================
-   LOGIN
-   ============================================================ */
-const savedUser = localStorage.getItem('lc79_user');
-if(savedUser){ $('username').value = savedUser; $('remember').checked = true; }
-
-$('loginForm').addEventListener('submit', async (e)=>{
-  e.preventDefault(); hideError();
-  const username = $('username').value.trim();
-  const password = $('password').value;  // Gửi PLAINTEXT — server hash
-  if(!username || !password){ showError('Vui lòng nhập đầy đủ thông tin'); return; }
-
-  const btn = $('btnLogin');
-  btn.classList.add('loading'); btn.disabled = true;
-
+async function refresh(){
   try {
-    const res = await fetch('/api/login', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({ username, password })
-    });
-    const data = await res.json();
+    const r = await fetch(API_STATE);
+    const s = await r.json();
+    render(s);
 
-    if(data.success){
-      SERVER_TOKEN = data.server_token;
-      if($('remember').checked) localStorage.setItem('lc79_user', username);
-      else localStorage.removeItem('lc79_user');
-      localStorage.setItem('lc79_server_token', SERVER_TOKEN);
-      showDashboard(data);
-      startPolling();
-      toast('Đăng nhập thành công!', 'success');
-    } else {
-      showError(data.message || 'Đăng nhập thất bại');
+    // Ẩn overlay khi có data thật
+    if (s.ws_connected || (s.history && s.history.length >= 3)) {
+      hideLoading();
+    } else if (s.logged_in) {
+      $('loadTitle').textContent = 'Đang kết nối WebSocket...';
+      $('loadDesc').textContent = 'Login thành công, đang chờ server đẩy phiên đầu tiên.';
     }
-  } catch(err){
-    showError('Không thể kết nối server');
-  } finally {
-    btn.classList.remove('loading'); btn.disabled = false;
+    if (s.history && s.history.length >= 10) {
+      hideLoading();
+    }
+  } catch(e) {
+    $('wsLabel').textContent = 'Mất kết nối server';
   }
-});
-
-function showDashboard(loginData){
-  $('loginView').style.display = 'none';
-  $('dashboardView').style.display = 'block';
-
-  const sd = loginData.session_data || {};
-  const nick = loginData.nickname || sd.nickname || 'User';
-  const initial = nick.charAt(0).toUpperCase();
-
-  $('userAvatar').textContent = initial;
-  $('userChipName').textContent = nick;
-  $('welcomeAvatar').textContent = initial;
-  $('welcomeName').textContent = nick;
-  $('levelBadge').textContent = `★ LV.${loginData.curLevel || sd.curLevel || 1}`;
-  $('balanceValue').textContent = fmt(loginData.money);
 }
 
-/* ============================================================
-   LOGOUT
-   ============================================================ */
-$('btnLogout').addEventListener('click', async ()=>{
-  try { await fetch('/api/logout',{method:'POST',headers:{'X-Session-Token':SERVER_TOKEN}}); } catch(e){}
-  stopPolling();
-  localStorage.removeItem('lc79_server_token');
-  SERVER_TOKEN = null;
-  $('dashboardView').style.display = 'none';
-  $('loginView').style.display = 'block';
-  $('password').value = '';
-  hideError();
-});
-
-/* ============================================================
-   RESTORE SESSION
-   ============================================================ */
-(function restore(){
-  const saved = localStorage.getItem('lc79_server_token');
-  if(!saved) return;
-  SERVER_TOKEN = saved;
-  fetch('/api/state',{headers:{'X-Session-Token':saved}})
-    .then(r=>r.ok ? r.json() : null)
-    .then(state=>{
-      if(state){
-        const sd = state.session_data || {};
-        showDashboard({nickname:state.nickname, money:state.balance, curLevel:sd.curLevel||1, session_data:sd});
-        startPolling();
-      } else {
-        localStorage.removeItem('lc79_server_token');
-        SERVER_TOKEN = null;
-      }
-    })
-    .catch(()=>{ localStorage.removeItem('lc79_server_token'); SERVER_TOKEN = null; });
-})();
-
-/* ============================================================
-   POLLING
-   ============================================================ */
-function startPolling(){
-  if(POLL_TIMER) return;
-  pollState();
-  POLL_TIMER = setInterval(pollState, 1200);
-}
-function stopPolling(){
-  if(POLL_TIMER){ clearInterval(POLL_TIMER); POLL_TIMER = null; }
-}
-
-async function pollState(){
-  if(!SERVER_TOKEN) return;
-  try {
-    const res = await fetch('/api/state',{headers:{'X-Session-Token':SERVER_TOKEN}});
-    if(!res.ok){
-      if(res.status === 401){
-        stopPolling();
-        localStorage.removeItem('lc79_server_token');
-        SERVER_TOKEN = null;
-        $('dashboardView').style.display = 'none';
-        $('loginView').style.display = 'block';
-      }
-      return;
-    }
-    const state = await res.json();
-    updateDashboard(state);
-  } catch(e){ /* ignore */ }
-}
-
-function updateDashboard(s){
-  $('balanceValue').textContent = fmt(s.balance);
-
-  const plEl = $('plValue');
-  plEl.textContent = (s.profit_loss >= 0 ? '+' : '') + fmt(s.profit_loss);
-  plEl.className = 'stat-value ' + (s.profit_loss >= 0 ? 'win' : 'loss');
-  $('plCard').className = 'stat-card ' + (s.profit_loss >= 0 ? 'win' : 'loss');
-
-  $('streakValue').textContent = s.win_streak;
-  $('betValue').textContent = fmt(s.current_bet);
-  $('x2Badge').style.display = (s.x2_mode && s.win_streak >= 1) ? 'inline-block' : 'none';
-
-  // Connection status
-  const cs = $('connStatus');
-  if(s.game_connected){
-    cs.className = 'connection-status connected';
-    $('connText').textContent = 'Đã kết nối';
+function render(s){
+  // Header status
+  const dot = $('wsDot');
+  const lbl = $('wsLabel');
+  if (s.ws_connected){
+    dot.className = 'status-dot live';
+    lbl.textContent = 'WebSocket LIVE';
+  } else if (s.logged_in){
+    dot.className = 'status-dot off';
+    lbl.textContent = 'Đang reconnect...';
   } else {
-    cs.className = 'connection-status disconnected';
-    $('connText').textContent = 'Đang kết nối...';
+    dot.className = 'status-dot';
+    lbl.textContent = s.ws_error ? 'Lỗi login' : 'Khởi động...';
   }
 
-  // Background status
-  if(s.bg_status){
-    const bs = $('bgStatus');
-    const bt = $('bgStatusText');
-    if(s.bg_status.connected){
-      bs.className = 'bg-status on';
-      bt.textContent = `BG: ${s.bg_status.nickname || 'OK'} • ${s.history_len} phiên`;
-    } else if(s.bg_status.running){
-      bs.className = 'bg-status';
-      bt.textContent = `BG: đang kết nối lại...`;
-    } else {
-      bs.className = 'bg-status';
-      bt.textContent = `BG: offline`;
-    }
+  // Welcome
+  if (s.nickname){
+    $('welcomeName').textContent = s.nickname;
+    $('welcomeAvatar').textContent = s.nickname[0].toUpperCase();
+  }
+  const hist = s.history || [];
+  if (hist.length >= 10){
+    $('statBadge').textContent = '★ AI READY';
+  } else if (hist.length > 0){
+    $('statBadge').textContent = `ĐANG THU THẬP ${hist.length}/10`;
+  } else {
+    $('statBadge').textContent = 'ĐANG KHỞI ĐỘNG';
   }
 
-  $('sessionId').textContent = s.session_id || '—';
+  // Session
+  $('sessId').textContent = s.current_session ? '#'+s.current_session : '#—';
+  const tag = $('sessTag');
+  const cs = (s.current_state || '').toUpperCase();
+  tag.textContent = cs || 'WAITING';
+  tag.className = 'session-tag ' + (cs === 'BETTING' ? 'betting' : (cs === 'DEALING' ? 'dealing' : ''));
 
   // Prediction
-  const pv = $('predValue');
-  if(s.current_prediction){
-    pv.textContent = s.current_prediction === 'TAI' ? '🔵 TÀI' : '🔴 XỈU';
-    pv.className = 'pred-value ' + (s.current_prediction === 'TAI' ? 'tai' : 'xiu');
-  } else if(s.history_len < 10){
-    pv.textContent = `Thu thập dữ liệu (${s.history_len}/10)...`;
-    pv.className = 'pred-value unknown';
+  const pv = $('predVal');
+  const ps = $('predSub');
+  const p = s.current_prediction;
+  if (p === 'TAI'){ pv.textContent = '🔵 TÀI'; pv.className = 'pred-big tai'; ps.textContent = '35 cores đã vote'; }
+  else if (p === 'XIU'){ pv.textContent = '🔴 XỈU'; pv.className = 'pred-big xiu'; ps.textContent = '35 cores đã vote'; }
+  else {
+    pv.textContent = hist.length < 10 ? `Chờ đủ 10 phiên (${hist.length}/10)` : 'Chưa có dự đoán';
+    pv.className = 'pred-big empty';
+    ps.textContent = hist.length < 10 ? 'Đang tích lũy dữ liệu...' : 'Chờ phiên mới...';
+  }
+
+  // Result
+  const rv = $('resultVal');
+  const rd = $('resultDices');
+  const rm = $('resultMark');
+  const r = s.current_result;
+  if (r && r.result){
+    rv.textContent = r.result === 'TAI' ? '🔵 TÀI' : '🔴 XỈU';
+    rv.className = 'result-big ' + (r.result === 'TAI' ? 'tai' : 'xiu');
+    rd.textContent = (r.dices || []).join(' · ') || '—';
+    if (r.ok === true){ rm.textContent = '✓ AI đoán đúng'; rm.className = 'result-mark ok'; }
+    else if (r.ok === false){ rm.textContent = '✗ AI đoán sai'; rm.className = 'result-mark fail'; }
+    else { rm.textContent = '—'; rm.className = 'result-mark none'; }
   } else {
-    pv.textContent = 'Đang chờ phiên mới...';
-    pv.className = 'pred-value unknown';
+    rv.textContent = '—'; rv.className = 'result-big empty';
+    rd.textContent = '— · — · —';
+    rm.textContent = '—'; rm.className = 'result-mark none';
   }
 
-  if(s.current_result && s.dices){
-    $('lastResult').textContent = `${s.current_result} (${s.dices.join('-')})`;
+  // Stats
+  $('balanceVal').textContent = fmt(s.balance);
+  $('totalHistVal').textContent = hist.length;
+  $('accVal').textContent = (s.ai_accuracy || 0) + '%';
+  $('accVal').className = 'stat-value ' + (s.ai_accuracy >= 50 ? 'pos' : (s.ai_total > 0 ? 'neg' : ''));
+
+  // 10 phiên gần nhất
+  const r10 = $('recent10');
+  const last10 = hist.slice(-10).reverse();
+  let r10html = '';
+  for (let i = 0; i < 10; i++){
+    const v = last10[i];
+    if (v === 'TAI') r10html += `<div class="hist-big tai">T</div>`;
+    else if (v === 'XIU') r10html += `<div class="hist-big xiu">X</div>`;
+    else r10html += `<div class="hist-big empty">?</div>`;
+  }
+  r10.innerHTML = r10html;
+  $('recent10Badge').textContent = `${hist.length}/10`;
+
+  // Full history
+  const hg = $('historyGrid');
+  if (hist.length){
+    hg.innerHTML = hist.slice(-50).map(v =>
+      `<span class="hist-chip ${v === 'TAI' ? 'tai' : 'xiu'}">${v === 'TAI' ? 'T' : 'X'}</span>`
+    ).join('');
   } else {
-    $('lastResult').textContent = '—';
+    hg.innerHTML = '<span class="hist-empty">Chưa có dữ liệu</span>';
   }
+  $('histBadge').textContent = hist.length;
 
-  // History
-  const strip = $('historyStrip');
-  strip.innerHTML = (s.history || []).slice().reverse().map(r=>{
-    const cls = r === 'TAI' ? 'tai' : 'xiu';
-    const label = r === 'TAI' ? 'T' : 'X';
-    return `<div class="history-chip ${cls}">${label}</div>`;
-  }).join('');
-
-  // Settings — FIX: bỏ qua nếu đang pending
-  if(!isPending('base_bet') && document.activeElement !== $('baseBet')){
-    $('baseBet').value = s.base_bet;
-  }
-  if(!isPending('target_profit') && document.activeElement !== $('targetProfit')){
-    $('targetProfit').value = s.target_profit || 0;
-  }
-  if(!isPending('auto_bet')){
-    $('autoBetToggle').classList.toggle('on', s.auto_bet);
-  }
-  if(!isPending('x2_mode')){
-    $('x2Toggle').classList.toggle('on', s.x2_mode);
-  }
-
-  // Weights
-  const wl = $('weightsList');
-  if(s.ai_weights && s.ai_weights.length){
-    const maxW = s.ai_weights[0][1] || 1;
-    wl.innerHTML = s.ai_weights.map(([k,v])=>{
-      const pct = Math.min(100, (v/maxW)*100);
-      return `<div class="weight-row">
-        <div class="weight-name">${k}</div>
-        <div class="weight-bar"><div class="weight-bar-fill" style="width:${pct}%"></div></div>
-        <div class="weight-value">${v.toFixed(1)}</div>
-      </div>`;
-    }).join('');
+  // AI Cores
+  const cg = $('coresGrid');
+  if (s.ai_weights_top && s.ai_weights_top.length){
+    cg.innerHTML = s.ai_weights_top.map(([k, v]) =>
+      `<span class="hist-chip tai" style="min-width:auto;padding:5px 10px;background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe">${esc(k)} · ${v.toFixed(2)}</span>`
+    ).join('');
   }
 
   // Logs
-  const logList = $('logList');
-  if(s.log && s.log.length){
-    logList.innerHTML = s.log.slice().reverse().map(l=>{
-      let cls = 'log-item';
-      if(l.msg.includes('THẮNG') || l.msg.includes('ĐẠT TARGET')) cls += ' win';
-      else if(l.msg.includes('THUA')) cls += ' loss';
-      else if(l.msg.includes('BET') || l.msg.includes('Đặt cược')) cls += ' bet';
-      return `<div class="${cls}"><span class="log-time">${l.time}</span><span class="log-msg">${escapeHtml(l.msg)}</span></div>`;
+  const ll = $('logList');
+  if (s.logs && s.logs.length){
+    ll.innerHTML = s.logs.map(l => {
+      const t = new Date(l.t * 1000).toLocaleTimeString('vi-VN');
+      let msg = esc(l.msg);
+      msg = msg.replace(/^✅/, '<span class="ok">✅</span>');
+      msg = msg.replace(/^❌/, '<span class="fail">❌</span>');
+      return `<div><span class="t">[${t}]</span> ${msg}</div>`;
     }).join('');
-  } else {
-    logList.innerHTML = '<div style="color:var(--muted);font-size:13px;text-align:center;padding:20px">Chưa có hoạt động</div>';
+    ll.scrollTop = ll.scrollHeight;
   }
 }
 
-/* ============================================================
-   SETTINGS API
-   ============================================================ */
-async function updateSetting(patch){
-  if(!SERVER_TOKEN) return;
-  try {
-    await fetch('/api/settings',{
-      method:'POST',
-      headers:{'Content-Type':'application/json','X-Session-Token':SERVER_TOKEN},
-      body:JSON.stringify(patch)
-    });
-  } catch(e){ console.error(e); }
-}
-
-/* ============================================================
-   TOGGLE BUTTONS — FIX CHUẨN (optimistic + pending)
-   ============================================================ */
-$('autoBetToggle').addEventListener('click', (e)=>{
-  e.preventDefault();
-  e.stopPropagation();
-  const wasOn = $('autoBetToggle').classList.contains('on');
-  // Optimistic update
-  $('autoBetToggle').classList.toggle('on', !wasOn);
-  setPending('auto_bet', 2500);
-  updateSetting({ auto_bet: !wasOn });
-  toast(wasOn ? '🔴 Đã tắt Auto Cược' : '🟢 Đã bật Auto Cược (REAL)', wasOn ? 'info' : 'success');
-});
-
-$('x2Toggle').addEventListener('click', (e)=>{
-  e.preventDefault();
-  e.stopPropagation();
-  const wasOn = $('x2Toggle').classList.contains('on');
-  $('x2Toggle').classList.toggle('on', !wasOn);
-  setPending('x2_mode', 2500);
-  updateSetting({ x2_mode: !wasOn });
-  toast(wasOn ? '🔴 Đã tắt X2' : '🔥 Đã bật X2', wasOn ? 'info' : 'success');
-});
-
-/* ============================================================
-   INPUT DEBOUNCE
-   ============================================================ */
-let baseBetTimer = null;
-$('baseBet').addEventListener('input', ()=>{
-  clearTimeout(baseBetTimer);
-  setPending('base_bet', 3000);
-  baseBetTimer = setTimeout(()=>{
-    const v = Math.max(1000, parseInt($('baseBet').value)||10000);
-    updateSetting({ base_bet: v });
-  }, 700);
-});
-
-let targetTimer = null;
-$('targetProfit').addEventListener('input', ()=>{
-  clearTimeout(targetTimer);
-  setPending('target_profit', 3000);
-  targetTimer = setTimeout(()=>{
-    const v = Math.max(0, parseInt($('targetProfit').value)||0);
-    updateSetting({ target_profit: v });
-  }, 700);
-});
-
-/* ============================================================
-   MANUAL BET
-   ============================================================ */
-async function manualBet(side){
-  if(!SERVER_TOKEN){ toast('Chưa đăng nhập', 'error'); return; }
-  const amt = Math.max(1000, parseInt($('baseBet').value)||10000);
-  if(!confirm(`Đặt ${side} ${fmt(amt)} VIN phiên này?`)) return;
-
-  try {
-    const res = await fetch('/api/manual-bet', {
-      method:'POST',
-      headers:{'Content-Type':'application/json','X-Session-Token':SERVER_TOKEN},
-      body:JSON.stringify({ side, amount: amt })
-    });
-    const data = await res.json();
-    if(data.ok){
-      toast(`🎯 Đã đặt ${side} ${fmt(amt)} VIN`, 'success');
-    } else {
-      toast(data.error || 'Lỗi đặt cược', 'error');
-    }
-  } catch(e){
-    toast('Lỗi kết nối', 'error');
-  }
-  pollState();
-}
-
-$('btnManualTai').addEventListener('click', ()=> manualBet('TAI'));
-$('btnManualXiu').addEventListener('click', ()=> manualBet('XIU'));
+// Bắt đầu polling
+refresh();
+pollTimer = setInterval(refresh, 1500);
 </script>
 </body>
 </html>
 """
 
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
+# ==========================================================
+# Khởi động background collector (chạy 24/7)
+# ==========================================================
+ensure_background()
 
-
-# ==========================================
-# STARTUP — Auto start Background Collector
-# ==========================================
-def start_bg_thread():
-    global BG_THREAD_STARTED
-    if BG_THREAD_STARTED:
-        return
-    BG_THREAD_STARTED = True
-    t = threading.Thread(target=background_data_collector, daemon=True)
-    t.start()
-
-
-if __name__ == '__main__':
-    print("=" * 64)
-    print("🚀 LC79 AUTO WEB VIP V4")
-    print("🧠 35 AI Cores + Exponential Weighting")
-    print("🛰️  Background Collector: HuyDaiXuLC79 (auto login 24/7)")
-    print("💵 Auto Bet REAL + X2 + Manual Bet")
-    print("🌐 http://localhost:5000")
-    print("=" * 64)
-    start_bg_thread()
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+if __name__ == "__main__":
+    print("=" * 60)
+    print("🤖 LC79 LIVE MONITOR")
+    print(f"   Collector: {COLLECTOR_USER}")
+    print(f"   WebSocket: {WS_URL}/{WS_PATH}")
+    print(f"   Chế độ: chạy nền 24/7, tự reconnect")
+    print("=" * 60)
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
