@@ -1,5 +1,5 @@
 """
-⚡ ULTRA VIP V4 — Single File Edition
+⚡ ULTRA VIP V4 — Clean Edition
 35 AI Cores · Live Accuracy · Confidence Gating · Kelly Sizing · Stop-Loss · Cooldown
 Web UI · LC79 Manual Code · Auto Bet
 """
@@ -66,10 +66,9 @@ def new_user_state(uid):
         'session_id': None, 'last_predictions': {}, 'logs': deque(maxlen=300),
         'lc79_jwt': None, 'lc79_api': 'https://api.lc79.luxury/v1/code/redeem',
         'lc79_strip4': True, 'last_dices': [0, 0, 0], 'last_result': None,
-        # ---- V4 ----
         'current_confidence': 0.0,
         'confidence_details': {},
-        'confidence_threshold': 0.62,
+        'confidence_threshold': 0.68,
         'consecutive_losses': 0,
         'cooldown_remaining': 0,
         'stop_loss': 500000,
@@ -167,10 +166,13 @@ def compute_all_models(history):
 
 
 # ============================================================
-# V4 PREDICTION + CONFIDENCE
+# V4 PREDICTION + CONFIDENCE (NÂNG CẤP SIÊU CHUẨN)
 # ============================================================
 def make_prediction(uid):
-    """Returns (pred, confidence, details)"""
+    """
+    Returns (pred, confidence, details)
+    Nâng cấp: weighting mũ bậc 2 + Top-K Consensus + phạt đồng thuận yếu.
+    """
     state = USERS[uid]
     history = list(GLOBAL_HISTORY)
 
@@ -183,16 +185,19 @@ def make_prediction(uid):
     score = {"TAI": 0.0, "XIU": 0.0}
     vote_count = {"TAI": 0, "XIU": 0}
     total_w = 0.0
+    reliabilities = {}
 
     for m, p in model_preds.items():
         acc = MODEL_ACCURACY.get(m, {'rec_correct': 0, 'rec_total': 0})
         base_w = GLOBAL_AI_WEIGHTS.get(m, 1.0)
-        if acc['rec_total'] >= 5:
+        if acc['rec_total'] >= 8:
             rec_acc = acc['rec_correct'] / acc['rec_total']
-            acc_factor = max(0.2, rec_acc * 2)
+            # Ưu tiên mạnh model có accuracy thực cao
+            acc_factor = max(0.15, (rec_acc ** 2) * 2.5)
         else:
-            acc_factor = 0.7
+            acc_factor = 0.6
         reliability = base_w * acc_factor
+        reliabilities[m] = reliability
         score[p] += reliability
         vote_count[p] += 1
         total_w += reliability
@@ -205,21 +210,36 @@ def make_prediction(uid):
 
     margin = (score[pred] - score[other]) / total_w
     agree_pct = vote_count[pred] / len(model_preds)
-    confidence = 0.5 * margin + 0.5 * agree_pct
-    confidence = min(0.85, confidence * 1.3)
 
-    if agree_pct < 0.55:
-        confidence *= 0.7
+    # Top-K consensus: lấy 7 model có trọng số cao nhất, xem có đồng thuận
+    top_models = sorted(reliabilities.items(), key=lambda x: x[1], reverse=True)[:7]
+    top_agree = sum(1 for m, _ in top_models if model_preds[m] == pred)
+    top_consensus = top_agree / max(1, len(top_models))
+
+    # Confidence = kết hợp margin + agree + top consensus
+    confidence = 0.45 * margin + 0.35 * agree_pct + 0.20 * top_consensus
+
+    # Phạt khi đồng thuận yếu
+    if top_consensus < 0.70:
+        confidence *= 0.75
+    if agree_pct < 0.60:
+        confidence *= 0.80
+    if margin < 0.05:
+        confidence *= 0.70
+
+    confidence = max(0.0, min(0.82, confidence))
 
     return pred, confidence, {
         "score": score, "votes": vote_count,
-        "margin": round(margin, 3), "agree_pct": round(agree_pct, 3),
+        "margin": round(margin, 3),
+        "agree_pct": round(agree_pct, 3),
+        "top_consensus": round(top_consensus, 3),
         "n_models": len(model_preds),
     }
 
 
 def update_ai_weights(actual_result, uid=None):
-    """V4: cập nhật trọng số dựa trên live accuracy (cửa sổ trượt 30)"""
+    """Cập nhật trọng số dựa trên live accuracy (cửa sổ trượt 30)"""
     global GLOBAL_AI_WEIGHTS
     preds = None
     if uid and uid in USERS:
@@ -250,7 +270,7 @@ def update_ai_weights(actual_result, uid=None):
 
 
 # ============================================================
-# V4 RISK + KELLY
+# RISK + KELLY
 # ============================================================
 def check_risk_limits(uid):
     s = USERS[uid]
@@ -344,13 +364,11 @@ def start_game_ws(uid):
         state['has_bet_this_session'] = False
         state['waiting_for_result'] = False
 
-        # V4 prediction
         pred, conf, details = make_prediction(uid)
         state['current_prediction'] = pred
         state['current_confidence'] = conf
         state['confidence_details'] = details
 
-        # Gating
         allowed, reason = check_risk_limits(uid)
         if pred is None:
             state['skip_reason'] = details.get('reason', 'Không có dự đoán')
@@ -365,9 +383,13 @@ def start_game_ws(uid):
             add_log(uid, f"🛑 SKIP phiên: conf {conf:.0%} thấp", 'warn')
         else:
             state['skip_reason'] = None
-            add_log(uid, f"🎯 AI chốt {pred} (conf {conf:.0%}, agree {details.get('agree_pct',0):.0%})", 'info')
+            add_log(
+                uid,
+                f"🎯 AI chốt {pred} (conf {conf:.0%} · margin {details.get('margin',0):.0%} · "
+                f"top {details.get('top_consensus',0):.0%})",
+                'info'
+            )
 
-        # Bet sizing
         if state['x2_mode'] and state['win_streak'] >= 1:
             kelly = calculate_bet_size(uid)
             state['current_bet'] = max(kelly, state['base_bet'] * 2)
@@ -529,9 +551,8 @@ def api_state():
         'lc79_strip4': u['lc79_strip4'],
         'logs': list(u['logs'])[-50:],
         'ai_top': sorted(GLOBAL_AI_WEIGHTS.items(), key=lambda x: x[1], reverse=True)[:10],
-        # V4 fields
         'current_confidence': u.get('current_confidence', 0),
-        'confidence_threshold': u.get('confidence_threshold', 0.62),
+        'confidence_threshold': u.get('confidence_threshold', 0.68),
         'skip_reason': u.get('skip_reason'),
         'consecutive_losses': u.get('consecutive_losses', 0),
         'cooldown_remaining': u.get('cooldown_remaining', 0),
@@ -607,7 +628,6 @@ def api_config():
         add_log(uid, "🔑 Đã lưu JWT LC79", 'info')
     if 'lc79_api' in d and d['lc79_api']: u['lc79_api'] = d['lc79_api']
     if 'lc79_strip4' in d: u['lc79_strip4'] = bool(d['lc79_strip4'])
-    # V4
     if 'confidence_threshold' in d:
         try: u['confidence_threshold'] = max(0.5, min(0.85, float(d['confidence_threshold'])))
         except: pass
@@ -647,309 +667,447 @@ def on_ws_connect(auth=None):
         USERS[uid] = new_user_state(uid)
 
 # ============================================================
-# HTML PAGE (embedded raw string)
+# HTML PAGE (CLEAN + NO-ZOOM)
 # ============================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="format-detection" content="telephone=no">
 <title>⚡ ULTRA VIP V4 — TX AI</title>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script src="https://cdn.tailwindcss.com"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
 <style>
-  * { font-family: 'Inter', -apple-system, sans-serif; }
-  .mono { font-family: 'JetBrains Mono', monospace; }
-  body { background: #05050a; color: #e5e7eb; overflow-x: hidden; min-height: 100vh; }
-  .bg-blob { position: fixed; border-radius: 50%; filter: blur(120px); opacity: 0.35; z-index: 0; animation: float 20s ease-in-out infinite; pointer-events: none; }
-  .blob-1 { width: 500px; height: 500px; background: #7c3aed; top: -150px; left: -150px; }
-  .blob-2 { width: 400px; height: 400px; background: #06b6d4; bottom: -100px; right: -100px; animation-delay: -7s; }
-  .blob-3 { width: 350px; height: 350px; background: #ec4899; top: 40%; left: 40%; animation-delay: -14s; }
-  @keyframes float {
-    0%, 100% { transform: translate(0, 0) scale(1); }
-    33% { transform: translate(60px, -80px) scale(1.1); }
-    66% { transform: translate(-40px, 60px) scale(0.9); }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    touch-action: pan-x pan-y;
+    -ms-touch-action: pan-x pan-y;
   }
-  .glass { background: rgba(15, 15, 25, 0.55); backdrop-filter: blur(20px) saturate(180%); -webkit-backdrop-filter: blur(20px) saturate(180%); border: 1px solid rgba(255,255,255,0.08); border-radius: 20px; box-shadow: 0 8px 40px rgba(0,0,0,0.4); }
-  .neon-purple { box-shadow: 0 0 30px rgba(139,92,246,0.4); }
-  .btn-primary { background: linear-gradient(135deg, #8b5cf6, #6366f1); transition: all 0.25s; border: 1px solid rgba(139,92,246,0.4); }
-  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 10px 30px rgba(139,92,246,0.4); }
-  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-  .toggle { position: relative; width: 52px; height: 28px; background: #27272a; border-radius: 999px; transition: all 0.3s; cursor: pointer; border: 1px solid rgba(255,255,255,0.1); flex-shrink: 0; }
-  .toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 22px; height: 22px; background: #fff; border-radius: 50%; transition: all 0.3s; }
-  .toggle.on { background: linear-gradient(135deg, #8b5cf6, #06b6d4); box-shadow: 0 0 20px rgba(139,92,246,0.5); }
-  .toggle.on::after { transform: translateX(24px); }
-  .pulse-dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 0 rgba(16,185,129,0.7); animation: pulse 2s infinite; }
-  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(16,185,129,0.7); } 70% { box-shadow: 0 0 0 12px rgba(16,185,129,0); } 100% { box-shadow: 0 0 0 0 rgba(16,185,129,0); } }
-  .history-bar { height: 34px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 800; letter-spacing: 0.5px; transition: transform 0.15s; cursor: default; }
-  .history-bar:hover { transform: scale(1.08); }
-  .bar-tai { background: linear-gradient(135deg, #3b82f6, #06b6d4); color: white; box-shadow: 0 2px 8px rgba(59,130,246,0.4); }
-  .bar-xiu { background: linear-gradient(135deg, #ef4444, #f43f5e); color: white; box-shadow: 0 2px 8px rgba(239,68,68,0.4); }
-  .dice { width: 60px; height: 60px; background: linear-gradient(135deg, #f8fafc, #cbd5e1); border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 32px; font-weight: 900; color: #1e293b; box-shadow: inset 0 -4px 12px rgba(0,0,0,0.15), 0 4px 20px rgba(0,0,0,0.3); transition: all 0.3s; animation: diceRoll 0.6s ease-out; }
-  @keyframes diceRoll { 0% { transform: rotate(0) scale(0.8); } 50% { transform: rotate(180deg) scale(1.15); } 100% { transform: rotate(360deg) scale(1); } }
-  .log-line { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; padding: 5px 10px; border-radius: 6px; margin-bottom: 3px; background: rgba(0,0,0,0.25); border-left: 3px solid; line-height: 1.4; }
+  * { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+  body {
+    background: #0b0b12;
+    color: #e5e7eb;
+    min-height: 100vh;
+    margin: 0;
+    overflow-x: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .card {
+    background: #13131d;
+    border: 1px solid #232330;
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .card-tight { padding: 14px 18px; }
+  .label-xs {
+    font-size: 10px;
+    font-weight: 700;
+    color: #71717a;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .btn {
+    background: #6366f1;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 11px 18px;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .btn:hover:not(:disabled) { background: #4f46e5; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-ghost {
+    background: #1a1a26;
+    border: 1px solid #2a2a3a;
+    color: #d4d4d8;
+  }
+  .btn-ghost:hover:not(:disabled) { background: #232330; }
+  .input {
+    background: #0a0a12;
+    border: 1px solid #2a2a3a;
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: #f3f4f6;
+    width: 100%;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .input:focus { border-color: #6366f1; }
+  .toggle {
+    position: relative;
+    width: 44px;
+    height: 24px;
+    background: #2a2a3a;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background 0.2s;
+    flex-shrink: 0;
+    border: none;
+    padding: 0;
+  }
+  .toggle::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 20px;
+    height: 20px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform 0.2s;
+  }
+  .toggle.on { background: #6366f1; }
+  .toggle.on::after { transform: translateX(20px); }
+  .history-bar {
+    height: 30px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 800;
+    color: #fff;
+  }
+  .bar-tai { background: #3b82f6; }
+  .bar-xiu { background: #ef4444; }
+  .dice {
+    width: 54px;
+    height: 54px;
+    background: #e5e7eb;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 26px;
+    font-weight: 800;
+    color: #111827;
+  }
+  .log-line {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    padding: 5px 9px;
+    border-radius: 4px;
+    margin-bottom: 3px;
+    background: #0a0a12;
+    border-left: 2px solid #6366f1;
+    line-height: 1.45;
+    word-break: break-word;
+  }
   .log-info { border-color: #6366f1; color: #c7d2fe; }
   .log-success, .log-win { border-color: #10b981; color: #86efac; }
   .log-error, .log-lose { border-color: #ef4444; color: #fca5a5; }
   .log-warn { border-color: #f59e0b; color: #fde68a; }
   .log-bet { border-color: #8b5cf6; color: #ddd6fe; }
-  .scroll::-webkit-scrollbar { width: 6px; }
+  .toast {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    padding: 12px 18px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 13px;
+    z-index: 9999;
+    border: 1px solid;
+    background: #13131d;
+    min-width: 240px;
+    animation: fadeIn 0.2s ease-out;
+  }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .toast-win { border-color: #10b981; color: #86efac; }
+  .toast-lose { border-color: #ef4444; color: #fca5a5; }
+  .scroll::-webkit-scrollbar { width: 5px; }
   .scroll::-webkit-scrollbar-track { background: transparent; }
-  .scroll::-webkit-scrollbar-thumb { background: rgba(139,92,246,0.4); border-radius: 3px; }
-  .prediction-card { background: linear-gradient(135deg, rgba(139,92,246,0.15), rgba(6,182,212,0.15)); border: 1px solid rgba(139,92,246,0.3); animation: glow 3s ease-in-out infinite alternate; }
-  @keyframes glow { from { box-shadow: 0 0 20px rgba(139,92,246,0.15); } to { box-shadow: 0 0 40px rgba(139,92,246,0.35); } }
-  .input-field { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 12px 16px; color: #f3f4f6; width: 100%; transition: all 0.2s; outline: none; font-size: 14px; }
-  .input-field:focus { border-color: #8b5cf6; background: rgba(139,92,246,0.08); box-shadow: 0 0 0 3px rgba(139,92,246,0.15); }
-  .toast { position: fixed; top: 20px; right: 20px; padding: 16px 24px; border-radius: 14px; font-weight: 600; z-index: 9999; animation: slideIn 0.4s ease-out; backdrop-filter: blur(20px); border: 1px solid; min-width: 280px; }
-  @keyframes slideIn { from { transform: translateX(120%); } to { transform: translateX(0); } }
-  .toast-win { background: rgba(16,185,129,0.2); border-color: #10b981; color: #86efac; }
-  .toast-lose { background: rgba(239,68,68,0.2); border-color: #ef4444; color: #fca5a5; }
-  .fade-in { animation: fadeIn 0.4s ease-out; }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-  .badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; }
+  .scroll::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 3px; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+  }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #71717a; }
+  .status-dot.online { background: #10b981; }
+  .progress { height: 6px; background: #1a1a26; border-radius: 999px; overflow: hidden; }
+  .progress-fill { height: 100%; background: #6366f1; transition: width 0.4s; }
 </style>
 </head>
-<body class="relative">
+<body>
 
-<div class="bg-blob blob-1"></div>
-<div class="bg-blob blob-2"></div>
-<div class="bg-blob blob-3"></div>
 <div id="toasts"></div>
 
-<header class="relative z-10 px-4 md:px-8 py-5 border-b border-white/5 backdrop-blur-xl">
-  <div class="max-w-7xl mx-auto flex items-center justify-between flex-wrap gap-4">
-    <div class="flex items-center gap-3">
-      <div class="w-11 h-11 rounded-xl bg-gradient-to-br from-violet-500 via-purple-500 to-cyan-500 flex items-center justify-center text-2xl shadow-lg shadow-purple-500/40">⚡</div>
+<header style="border-bottom: 1px solid #1a1a26; padding: 14px 20px;">
+  <div style="max-width: 1200px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
+    <div style="display: flex; align-items: center; gap: 10px;">
+      <div style="width: 38px; height: 38px; border-radius: 10px; background: #6366f1; display: flex; align-items: center; justify-content: center; font-size: 18px;">⚡</div>
       <div>
-        <h1 class="text-lg md:text-xl font-black bg-gradient-to-r from-violet-400 via-fuchsia-400 to-cyan-400 bg-clip-text text-transparent tracking-tight">ULTRA VIP V4</h1>
-        <p class="text-[10px] text-zinc-500 font-semibold tracking-widest uppercase">35 AI Cores · Confidence Gating · Kelly</p>
+        <h1 style="font-size: 16px; font-weight: 800; margin: 0; line-height: 1.1;">ULTRA VIP V4</h1>
+        <p style="font-size: 10px; color: #71717a; margin: 2px 0 0;">35 AI · Confidence · Kelly</p>
       </div>
     </div>
-    <div class="flex items-center gap-2 md:gap-3">
-      <div class="glass px-3 py-2 flex items-center gap-2 text-xs">
-        <div class="w-2 h-2 rounded-full bg-zinc-500" id="statusDot"></div>
-        <span id="statusText" class="text-zinc-400 font-semibold">Chưa kết nối</span>
+    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+      <div style="background: #13131d; border: 1px solid #232330; border-radius: 8px; padding: 8px 12px; display: flex; align-items: center; gap: 8px;">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText" style="font-size: 12px; color: #71717a; font-weight: 500;">Chưa kết nối</span>
       </div>
-      <div class="glass px-4 py-2 text-right">
-        <div class="text-[9px] text-zinc-500 font-bold tracking-widest uppercase">Số dư</div>
-        <div class="text-sm md:text-base font-black text-emerald-400 mono" id="hdrBalance">0</div>
+      <div style="background: #13131d; border: 1px solid #232330; border-radius: 8px; padding: 6px 14px; text-align: right; min-width: 100px;">
+        <div class="label-xs">Số dư</div>
+        <div style="font-size: 15px; font-weight: 800; color: #10b981; line-height: 1.2;" class="mono" id="hdrBalance">0</div>
       </div>
     </div>
   </div>
 </header>
 
-<main class="relative z-10 max-w-7xl mx-auto p-4 md:p-8">
+<main style="max-width: 1200px; margin: 0 auto; padding: 20px;">
 
+<!-- LOGIN SCREEN -->
 <section id="loginScreen">
-  <div class="max-w-md mx-auto mt-8 md:mt-16 fade-in">
-    <div class="glass p-8 md:p-10 neon-purple">
-      <div class="text-center mb-8">
-        <div class="w-20 h-20 mx-auto rounded-3xl bg-gradient-to-br from-violet-500 to-cyan-500 flex items-center justify-center text-4xl shadow-2xl shadow-purple-500/50 mb-4">🎰</div>
-        <h2 class="text-2xl font-black mb-2">Đăng nhập tài khoản</h2>
-        <p class="text-zinc-500 text-sm">Nhập tài khoản game tele68 của bạn</p>
+  <div style="max-width: 420px; margin: 40px auto 0;">
+    <div class="card">
+      <div style="text-align: center; margin-bottom: 24px;">
+        <div style="width: 64px; height: 64px; margin: 0 auto 16px; border-radius: 16px; background: #6366f1; display: flex; align-items: center; justify-content: center; font-size: 28px;">🎰</div>
+        <h2 style="font-size: 20px; font-weight: 800; margin: 0 0 4px;">Đăng nhập</h2>
+        <p style="font-size: 13px; color: #71717a; margin: 0;">Nhập tài khoản tele68</p>
       </div>
-      <div class="space-y-4">
+      <div style="display: flex; flex-direction: column; gap: 14px;">
         <div>
-          <label class="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Tài khoản</label>
-          <input type="text" id="inpUser" class="input-field mono" placeholder="username">
+          <label class="label-xs" style="display:block; margin-bottom: 6px;">Tài khoản</label>
+          <input type="text" id="inpUser" class="input mono" placeholder="username" autocomplete="username">
         </div>
         <div>
-          <label class="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Mật khẩu</label>
-          <input type="password" id="inpPass" class="input-field mono" placeholder="••••••••" onkeydown="if(event.key==='Enter') doLogin()">
+          <label class="label-xs" style="display:block; margin-bottom: 6px;">Mật khẩu</label>
+          <input type="password" id="inpPass" class="input mono" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter') doLogin()">
         </div>
-        <button onclick="doLogin()" id="btnLogin" class="btn-primary w-full py-3.5 rounded-xl font-bold text-white">🚀 Đăng nhập</button>
-        <p id="loginError" class="text-red-400 text-sm text-center hidden"></p>
+        <button onclick="doLogin()" id="btnLogin" class="btn" style="width:100%; margin-top: 4px;">Đăng nhập</button>
+        <p id="loginError" style="color: #fca5a5; font-size: 13px; text-align: center; margin: 0; display: none;"></p>
       </div>
     </div>
   </div>
 </section>
 
-<section id="dashboard" class="hidden">
-  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6">
+<!-- DASHBOARD -->
+<section id="dashboard" style="display: none;">
+  <div style="display: grid; grid-template-columns: 1fr; gap: 16px;" id="dashGrid">
 
-    <div class="lg:col-span-2 space-y-4 md:space-y-6">
-      <div class="glass p-5 md:p-6 fade-in">
-        <div class="flex items-center justify-between flex-wrap gap-4">
-          <div class="flex items-center gap-4">
-            <div class="w-14 h-14 rounded-2xl bg-gradient-to-br from-violet-500 to-cyan-500 flex items-center justify-center text-2xl font-black shadow-lg shadow-purple-500/30"><span id="avatarLetter">A</span></div>
+    <!-- LEFT COLUMN -->
+    <div style="display: flex; flex-direction: column; gap: 16px;">
+
+      <!-- Account card -->
+      <div class="card">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div style="width: 46px; height: 46px; border-radius: 12px; background: #6366f1; display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 800;"><span id="avatarLetter">A</span></div>
             <div>
-              <div class="text-xs text-zinc-500 font-bold uppercase tracking-widest">Tài khoản</div>
-              <div class="text-xl font-black" id="nickname">-</div>
+              <div class="label-xs">Tài khoản</div>
+              <div style="font-size: 17px; font-weight: 800; line-height: 1.2;" id="nickname">-</div>
             </div>
           </div>
-          <button onclick="doLogout()" class="text-xs text-zinc-400 hover:text-red-400 font-semibold px-3 py-2 rounded-lg hover:bg-red-500/10 transition">Đăng xuất →</button>
+          <button onclick="doLogout()" class="btn btn-ghost" style="font-size: 12px; padding: 8px 14px;">Đăng xuất</button>
         </div>
-        <div class="grid grid-cols-3 gap-3 mt-6">
-          <div class="bg-black/30 rounded-xl p-3 text-center">
-            <div class="text-[10px] text-zinc-500 font-bold uppercase tracking-wider mb-1">Số dư</div>
-            <div class="text-base font-black text-cyan-400 mono" id="cardBalance">0</div>
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 16px;">
+          <div style="background: #0a0a12; border: 1px solid #232330; border-radius: 8px; padding: 10px; text-align: center;">
+            <div class="label-xs" style="margin-bottom: 3px;">Số dư</div>
+            <div style="font-size: 15px; font-weight: 800; color: #06b6d4;" class="mono" id="cardBalance">0</div>
           </div>
-          <div class="bg-black/30 rounded-xl p-3 text-center">
-            <div class="text-[10px] text-zinc-500 font-bold uppercase tracking-wider mb-1">Lãi / Lỗ</div>
-            <div class="text-base font-black mono" id="cardPL">0</div>
+          <div style="background: #0a0a12; border: 1px solid #232330; border-radius: 8px; padding: 10px; text-align: center;">
+            <div class="label-xs" style="margin-bottom: 3px;">Lãi / Lỗ</div>
+            <div style="font-size: 15px; font-weight: 800;" class="mono" id="cardPL">0</div>
           </div>
-          <div class="bg-black/30 rounded-xl p-3 text-center">
-            <div class="text-[10px] text-zinc-500 font-bold uppercase tracking-wider mb-1">Chuỗi thắng</div>
-            <div class="text-base font-black text-amber-400 mono" id="cardStreak">0</div>
+          <div style="background: #0a0a12; border: 1px solid #232330; border-radius: 8px; padding: 10px; text-align: center;">
+            <div class="label-xs" style="margin-bottom: 3px;">Chuỗi thắng</div>
+            <div style="font-size: 15px; font-weight: 800; color: #f59e0b;" class="mono" id="cardStreak">0</div>
           </div>
         </div>
       </div>
 
-      <div class="prediction-card rounded-2xl p-6 md:p-8 fade-in">
-        <div class="flex items-center justify-between flex-wrap gap-4 mb-6">
+      <!-- Prediction card -->
+      <div class="card">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px;">
           <div>
-            <div class="text-[10px] text-violet-300 font-bold uppercase tracking-widest mb-1">Phiên hiện tại</div>
-            <div class="text-2xl md:text-3xl font-black mono" id="sessionId">#---</div>
+            <div class="label-xs">Phiên hiện tại</div>
+            <div style="font-size: 20px; font-weight: 800;" class="mono" id="sessionId">#---</div>
           </div>
-          <div class="flex gap-2 flex-wrap">
-            <div class="badge bg-violet-500/20 text-violet-300"><span class="pulse-dot"></span> LIVE</div>
-            <div class="badge bg-cyan-500/20 text-cyan-300" id="betBadge">AUTO: OFF</div>
-            <div class="badge bg-amber-500/20 text-amber-300" id="cooldownBadge" style="display:none">COOLDOWN</div>
-          </div>
-        </div>
-        <div class="flex items-center justify-center gap-8 md:gap-12 my-6 flex-wrap">
-          <div class="text-center">
-            <div class="text-[10px] text-zinc-400 font-bold uppercase tracking-widest mb-3">AI Dự đoán</div>
-            <div id="predictionBox" class="px-8 md:px-12 py-5 md:py-6 rounded-2xl bg-black/40 border border-white/10">
-              <div class="text-4xl md:text-5xl font-black tracking-tight text-zinc-500">...</div>
-              <div class="text-xs text-zinc-500 mt-1 font-semibold">chờ session</div>
-            </div>
-          </div>
-          <div class="text-center">
-            <div class="text-[10px] text-zinc-400 font-bold uppercase tracking-widest mb-3">Mức cược</div>
-            <div class="px-6 md:px-8 py-5 md:py-6 rounded-2xl bg-black/40 border border-white/10">
-              <div class="text-2xl md:text-3xl font-black text-emerald-400 mono" id="currentBet">0</div>
-              <div class="text-xs text-zinc-500 mt-1 font-semibold">Win</div>
-            </div>
+          <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+            <div class="badge" style="background: #1e1b4b; color: #a5b4fc;">LIVE</div>
+            <div class="badge" style="background: #0c4a6e; color: #7dd3fc;" id="betBadge">AUTO: OFF</div>
+            <div class="badge" style="background: #451a03; color: #fcd34d; display:none;" id="cooldownBadge">COOLDOWN</div>
           </div>
         </div>
 
-        <div class="mt-4 px-2">
-          <div class="flex justify-between text-[10px] mb-1">
-            <span class="text-zinc-400 font-bold uppercase tracking-wider">Confidence AI</span>
-            <span class="mono font-black text-violet-400" id="confVal">0%</span>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+          <div style="text-align: center; background: #0a0a12; border: 1px solid #232330; border-radius: 10px; padding: 16px 10px;">
+            <div class="label-xs" style="margin-bottom: 8px;">AI Dự đoán</div>
+            <div id="predictionBox">
+              <div style="font-size: 28px; font-weight: 800; color: #71717a;">...</div>
+              <div style="font-size: 11px; color: #52525b; margin-top: 2px;">chờ session</div>
+            </div>
           </div>
-          <div class="h-2 bg-white/5 rounded-full overflow-hidden">
-            <div id="confBar" class="h-full bg-gradient-to-r from-red-500 via-amber-500 to-emerald-500 transition-all duration-500" style="width:0%"></div>
+          <div style="text-align: center; background: #0a0a12; border: 1px solid #232330; border-radius: 10px; padding: 16px 10px;">
+            <div class="label-xs" style="margin-bottom: 8px;">Mức cược</div>
+            <div style="font-size: 22px; font-weight: 800; color: #10b981;" class="mono" id="currentBet">0</div>
+            <div style="font-size: 11px; color: #52525b; margin-top: 2px;">Win</div>
           </div>
-          <div id="skipReason" class="text-[10px] text-amber-400 mt-2 font-semibold hidden"></div>
         </div>
 
-        <div class="flex items-center justify-center gap-3 mt-6" id="diceRow">
+        <div style="margin-top: 14px;">
+          <div style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 6px;">
+            <span class="label-xs">Độ tin cậy AI</span>
+            <span class="mono" style="font-weight: 800; color: #a5b4fc;" id="confVal">0%</span>
+          </div>
+          <div class="progress">
+            <div id="confBar" class="progress-fill" style="width: 0%;"></div>
+          </div>
+          <div id="skipReason" style="font-size: 11px; color: #fbbf24; margin-top: 6px; font-weight: 600; display: none;"></div>
+        </div>
+
+        <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin: 18px 0 10px;" id="diceRow">
           <div class="dice">?</div><div class="dice">?</div><div class="dice">?</div>
         </div>
-        <div id="resultBadge" class="text-center mt-4 text-sm font-bold text-zinc-500">Chờ kết quả...</div>
+        <div id="resultBadge" style="text-align: center; margin-top: 8px; font-size: 13px; font-weight: 700; color: #71717a;">Chờ kết quả...</div>
       </div>
 
-      <div class="glass p-5 md:p-6 fade-in">
-        <div class="flex items-center justify-between mb-4">
+      <!-- History -->
+      <div class="card">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
           <div>
-            <div class="text-[10px] text-zinc-500 font-bold uppercase tracking-widest">Lịch sử 40 vòng gần nhất</div>
-            <div class="text-sm text-zinc-400 mt-1"><span id="historyCount">0</span> vòng tổng</div>
+            <div class="label-xs">Lịch sử 40 vòng</div>
+            <div style="font-size: 13px; color: #71717a; margin-top: 2px;"><span id="historyCount">0</span> vòng</div>
           </div>
-          <div class="flex gap-2 text-[10px] font-bold">
-            <span class="px-2 py-1 rounded bg-blue-500/20 text-blue-300">TÀI</span>
-            <span class="px-2 py-1 rounded bg-red-500/20 text-red-300">XỈU</span>
+          <div style="display: flex; gap: 6px; font-size: 10px; font-weight: 700;">
+            <span style="padding: 3px 8px; border-radius: 4px; background: #1e3a8a; color: #93c5fd;">TÀI</span>
+            <span style="padding: 3px 8px; border-radius: 4px; background: #7f1d1d; color: #fca5a5;">XỈU</span>
           </div>
         </div>
-        <div id="historyBars" class="grid grid-cols-10 gap-1.5"></div>
+        <div id="historyBars" style="display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px;"></div>
       </div>
     </div>
 
-    <div class="space-y-4 md:space-y-6">
-      <div class="glass p-5 md:p-6 fade-in">
-        <h3 class="text-sm font-black uppercase tracking-widest text-zinc-400 mb-5">⚙️ Cấu hình bot</h3>
-        <div class="flex items-center justify-between py-3 border-b border-white/5 gap-3">
-          <div><div class="font-bold text-sm">Auto cược</div><div class="text-[10px] text-zinc-500">Tự động đặt cược mỗi phiên</div></div>
-          <div class="toggle" id="tglAuto" onclick="toggleConfig('auto_bet_enabled', this)"></div>
+    <!-- RIGHT COLUMN -->
+    <div style="display: flex; flex-direction: column; gap: 16px;">
+
+      <!-- Config -->
+      <div class="card">
+        <h3 class="label-xs" style="margin: 0 0 14px;">Cấu hình bot</h3>
+
+        <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #1a1a26; gap: 10px;">
+          <div><div style="font-weight: 700; font-size: 13px;">Auto cược</div><div style="font-size: 10px; color: #71717a;">Tự động đặt cược</div></div>
+          <button class="toggle" id="tglAuto" onclick="toggleConfig('auto_bet_enabled', this)"></button>
         </div>
-        <div class="flex items-center justify-between py-3 border-b border-white/5 gap-3">
-          <div><div class="font-bold text-sm">Chế độ X2 🔥</div><div class="text-[10px] text-zinc-500">Thắng → x2, thua → về vốn gốc</div></div>
-          <div class="toggle" id="tglX2" onclick="toggleConfig('x2_mode', this)"></div>
+        <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #1a1a26; gap: 10px;">
+          <div><div style="font-weight: 700; font-size: 13px;">Chế độ X2</div><div style="font-size: 10px; color: #71717a;">Thắng → x2, thua → vốn gốc</div></div>
+          <button class="toggle" id="tglX2" onclick="toggleConfig('x2_mode', this)"></button>
         </div>
-        <div class="flex items-center justify-between py-3 border-b border-white/5 gap-3">
-          <div><div class="font-bold text-sm">Thông báo thắng</div><div class="text-[10px] text-zinc-500">Toast xanh khi thắng</div></div>
-          <div class="toggle" id="tglNotifyWin" onclick="toggleConfig('notify_win', this)"></div>
+        <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #1a1a26; gap: 10px;">
+          <div><div style="font-weight: 700; font-size: 13px;">Thông báo thắng</div></div>
+          <button class="toggle" id="tglNotifyWin" onclick="toggleConfig('notify_win', this)"></button>
         </div>
-        <div class="flex items-center justify-between py-3 border-b border-white/5 gap-3">
-          <div><div class="font-bold text-sm">Thông báo thua</div><div class="text-[10px] text-zinc-500">Toast đỏ khi thua</div></div>
-          <div class="toggle" id="tglNotifyLose" onclick="toggleConfig('notify_lose', this)"></div>
+        <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 0; gap: 10px;">
+          <div><div style="font-weight: 700; font-size: 13px;">Thông báo thua</div></div>
+          <button class="toggle" id="tglNotifyLose" onclick="toggleConfig('notify_lose', this)"></button>
         </div>
-        <div class="pt-4">
-          <label class="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Vốn cược mỗi phiên (Win)</label>
-          <div class="flex gap-2">
-            <input type="number" id="inpBaseBet" class="input-field mono" value="10000" step="1000" min="1000">
-            <button onclick="saveBaseBet()" class="btn-primary px-4 rounded-xl text-white font-bold text-sm whitespace-nowrap">Lưu</button>
+
+        <div style="margin-top: 12px;">
+          <label class="label-xs" style="display:block; margin-bottom: 6px;">Vốn cược mỗi phiên (Win)</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="number" id="inpBaseBet" class="input mono" value="10000" step="1000" min="1000">
+            <button onclick="saveBaseBet()" class="btn" style="padding: 10px 16px; white-space: nowrap;">Lưu</button>
           </div>
-          <div class="flex gap-1 mt-2">
-            <button onclick="setBet(10000)" class="flex-1 text-xs py-1.5 rounded-lg bg-white/5 hover:bg-white/10 transition">10K</button>
-            <button onclick="setBet(50000)" class="flex-1 text-xs py-1.5 rounded-lg bg-white/5 hover:bg-white/10 transition">50K</button>
-            <button onclick="setBet(100000)" class="flex-1 text-xs py-1.5 rounded-lg bg-white/5 hover:bg-white/10 transition">100K</button>
-            <button onclick="setBet(500000)" class="flex-1 text-xs py-1.5 rounded-lg bg-white/5 hover:bg-white/10 transition">500K</button>
+          <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px;">
+            <button onclick="setBet(10000)" class="btn btn-ghost" style="padding: 6px; font-size: 11px;">10K</button>
+            <button onclick="setBet(50000)" class="btn btn-ghost" style="padding: 6px; font-size: 11px;">50K</button>
+            <button onclick="setBet(100000)" class="btn btn-ghost" style="padding: 6px; font-size: 11px;">100K</button>
+            <button onclick="setBet(500000)" class="btn btn-ghost" style="padding: 6px; font-size: 11px;">500K</button>
           </div>
         </div>
-        <div class="pt-4">
-          <label class="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Chốt lãi tự động (Win)</label>
-          <input type="number" id="inpTarget" class="input-field mono" placeholder="VD: 500000 (trống = tắt)" step="10000" onblur="saveTarget()">
+
+        <div style="margin-top: 14px;">
+          <label class="label-xs" style="display:block; margin-bottom: 6px;">Chốt lãi tự động (Win)</label>
+          <input type="number" id="inpTarget" class="input mono" placeholder="VD: 500000 (trống = tắt)" step="10000" onblur="saveTarget()">
         </div>
-        <div class="pt-4">
-          <label class="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Ngưỡng confidence tối thiểu</label>
-          <input type="range" min="50" max="85" value="62" id="inpConfThresh" oninput="document.getElementById('confThreshVal').textContent=this.value+'%'; saveConfThresh()" class="w-full accent-violet-500">
-          <div class="text-right text-xs mono text-violet-400 mt-1" id="confThreshVal">62%</div>
+
+        <div style="margin-top: 14px;">
+          <label class="label-xs" style="display:block; margin-bottom: 6px;">Ngưỡng confidence tối thiểu</label>
+          <input type="range" min="60" max="85" value="68" id="inpConfThresh" oninput="document.getElementById('confThreshVal').textContent=this.value+'%'; saveConfThresh()" style="width: 100%; accent-color: #6366f1;">
+          <div style="text-align: right; font-size: 12px; color: #a5b4fc; font-weight: 700; margin-top: 4px;" id="confThreshVal">68%</div>
         </div>
-        <div class="pt-4">
-          <label class="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Cắt lỗ (Win)</label>
-          <input type="number" id="inpStopLoss" class="input-field mono" value="500000" step="100000" onblur="saveStopLoss()">
+
+        <div style="margin-top: 14px;">
+          <label class="label-xs" style="display:block; margin-bottom: 6px;">Cắt lỗ (Win)</label>
+          <input type="number" id="inpStopLoss" class="input mono" value="500000" step="100000" onblur="saveStopLoss()">
         </div>
       </div>
 
-      <div class="glass p-5 md:p-6 fade-in">
-        <h3 class="text-sm font-black uppercase tracking-widest text-zinc-400 mb-4">🎁 Nhập code LC79</h3>
-        <div class="space-y-3">
+      <!-- LC79 -->
+      <div class="card">
+        <h3 class="label-xs" style="margin: 0 0 12px;">Nhập code LC79</h3>
+        <div style="display: flex; flex-direction: column; gap: 10px;">
           <div>
-            <label class="text-[10px] font-bold text-zinc-500 uppercase tracking-wider mb-1 block">JWT Token</label>
-            <input type="password" id="inpJwt" class="input-field mono text-xs" placeholder="eyJhbGci...">
-          </div>
-          <div>
-            <label class="text-[10px] font-bold text-zinc-500 uppercase tracking-wider mb-1 block">API Endpoint</label>
-            <input type="text" id="inpLcApi" class="input-field mono text-xs" value="https://api.lc79.luxury/v1/code/redeem">
-          </div>
-          <div class="flex items-center gap-2 py-1">
-            <input type="checkbox" id="chkStrip4" checked class="w-4 h-4 accent-violet-500">
-            <label for="chkStrip4" class="text-xs text-zinc-400">Bỏ 4 ký tự cuối (vd: <span class="mono text-violet-300">WEYJZQLYBLC79</span> → <span class="mono text-emerald-300">WEYJZQLYB</span>)</label>
+            <label class="label-xs" style="display:block; margin-bottom: 4px;">JWT Token</label>
+            <input type="password" id="inpJwt" class="input mono" style="font-size: 11px;" placeholder="eyJhbGci...">
           </div>
           <div>
-            <label class="text-[10px] font-bold text-zinc-500 uppercase tracking-wider mb-1 block">Mã code</label>
-            <input type="text" id="inpCode" class="input-field mono uppercase" placeholder="WEYJZQLYBLC79" onkeydown="if(event.key==='Enter') submitCode()">
+            <label class="label-xs" style="display:block; margin-bottom: 4px;">API Endpoint</label>
+            <input type="text" id="inpLcApi" class="input mono" style="font-size: 11px;" value="https://api.lc79.luxury/v1/code/redeem">
           </div>
-          <button onclick="submitCode()" id="btnSubmitCode" class="btn-primary w-full py-3 rounded-xl font-bold text-white text-sm">📤 Submit code</button>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <input type="checkbox" id="chkStrip4" checked style="width: 16px; height: 16px; accent-color: #6366f1;">
+            <label for="chkStrip4" style="font-size: 11px; color: #a1a1aa;">Bỏ 4 ký tự cuối</label>
+          </div>
+          <div>
+            <label class="label-xs" style="display:block; margin-bottom: 4px;">Mã code</label>
+            <input type="text" id="inpCode" class="input mono" style="text-transform: uppercase;" placeholder="WEYJZQLYBLC79" onkeydown="if(event.key==='Enter') submitCode()">
+          </div>
+          <button onclick="submitCode()" id="btnSubmitCode" class="btn" style="width: 100%;">Submit code</button>
         </div>
       </div>
 
-      <div class="glass p-5 md:p-6 fade-in">
-        <div class="flex items-center justify-between mb-3">
-          <h3 class="text-sm font-black uppercase tracking-widest text-zinc-400">📜 Logs</h3>
-          <button onclick="document.getElementById('logsBox').innerHTML=''" class="text-[10px] text-zinc-500 hover:text-red-400 font-bold">CLEAR</button>
+      <!-- Logs -->
+      <div class="card">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
+          <h3 class="label-xs" style="margin: 0;">Logs</h3>
+          <button onclick="document.getElementById('logsBox').innerHTML=''" style="font-size: 10px; color: #71717a; background: none; border: none; cursor: pointer; font-weight: 700;">CLEAR</button>
         </div>
-        <div id="logsBox" class="scroll max-h-80 overflow-y-auto pr-1 space-y-1"></div>
+        <div id="logsBox" class="scroll" style="max-height: 300px; overflow-y: auto; padding-right: 2px;"></div>
       </div>
 
-      <div class="glass p-5 md:p-6 fade-in">
-        <h3 class="text-sm font-black uppercase tracking-widest text-zinc-400 mb-3">🧠 Top AI Cores</h3>
-        <div id="aiWeights" class="space-y-1.5"></div>
+      <!-- AI Weights -->
+      <div class="card">
+        <h3 class="label-xs" style="margin: 0 0 10px;">Top AI Cores</h3>
+        <div id="aiWeights" style="display: flex; flex-direction: column; gap: 6px;"></div>
       </div>
     </div>
   </div>
 </section>
 </main>
 
-<footer class="relative z-10 text-center py-6 text-[10px] text-zinc-600 font-semibold tracking-wider">
-  ULTRA VIP V4 · Live Accuracy · Confidence Gating · Kelly Sizing
+<footer style="text-align: center; padding: 24px 12px; font-size: 10px; color: #52525b; font-weight: 600; letter-spacing: 0.05em;">
+  ULTRA VIP V4 · Confidence Gating · Top-K Consensus · Kelly Sizing
 </footer>
 
 <script>
+// ===== DISABLE PINCH-ZOOM & DOUBLE-TAP ZOOM =====
+document.addEventListener('gesturestart', e => e.preventDefault(), { passive: false });
+document.addEventListener('gesturechange', e => e.preventDefault(), { passive: false });
+document.addEventListener('gestureend', e => e.preventDefault(), { passive: false });
+let _lastTouchEnd = 0;
+document.addEventListener('touchend', function(e) {
+  const now = Date.now();
+  if (now - _lastTouchEnd <= 320) e.preventDefault();
+  _lastTouchEnd = now;
+}, { passive: false });
+document.addEventListener('wheel', function(e) { if (e.ctrlKey) e.preventDefault(); }, { passive: false });
+
 const CLIENT_ID = (() => {
   let v = localStorage.getItem('uid');
   if (!v) { v = 'u_' + Math.random().toString(36).slice(2) + Date.now().toString(36); localStorage.setItem('uid', v); }
@@ -962,7 +1120,7 @@ let state = {
   x2_mode: false, win_streak: 0, profit_loss: 0, target_profit: null,
   current_prediction: null, session_id: null, history: [], logs: [],
   lc79_api: 'https://api.lc79.luxury/v1/code/redeem',
-  current_confidence: 0, confidence_threshold: 0.62,
+  current_confidence: 0, confidence_threshold: 0.68,
   stop_loss: 500000, cooldown_remaining: 0,
 };
 
@@ -982,8 +1140,8 @@ socket.on('new_session', (d) => {
   document.getElementById('confVal').textContent = Math.round((d.confidence || 0) * 100) + '%';
   document.getElementById('confBar').style.width = Math.round((d.confidence || 0) * 100) + '%';
   const sr = document.getElementById('skipReason');
-  if (d.skip_reason) { sr.textContent = '🛑 ' + d.skip_reason; sr.classList.remove('hidden'); }
-  else sr.classList.add('hidden');
+  if (d.skip_reason) { sr.textContent = '🛑 ' + d.skip_reason; sr.style.display = 'block'; }
+  else sr.style.display = 'none';
   renderPrediction();
 });
 
@@ -1011,8 +1169,6 @@ socket.on('result', (d) => {
   renderResult(d); renderStats();
 });
 
-socket.on('target_hit', (d) => showToast('win', `🏆 ĐẠT TARGET ${fmt(d.profit)} Win!`));
-
 async function api(path, method='GET', body=null) {
   const opts = { method, headers: { 'Content-Type': 'application/json', 'X-Client-Id': CLIENT_ID } };
   if (body) opts.body = JSON.stringify(body);
@@ -1033,14 +1189,14 @@ async function doLogin() {
   if (!u || !p) return;
   const btn = document.getElementById('btnLogin');
   const err = document.getElementById('loginError');
-  btn.disabled = true; btn.textContent = '⏳ Đang đăng nhập...';
-  err.classList.add('hidden');
+  btn.disabled = true; btn.textContent = 'Đang đăng nhập...';
+  err.style.display = 'none';
   try {
     const r = await api('/api/login', 'POST', { username: u, password: p });
     if (r.ok) await refreshState();
-    else { err.textContent = '❌ ' + (r.error || 'Đăng nhập thất bại'); err.classList.remove('hidden'); }
-  } catch(e) { err.textContent = '❌ ' + e.message; err.classList.remove('hidden'); }
-  btn.disabled = false; btn.textContent = '🚀 Đăng nhập';
+    else { err.textContent = '❌ ' + (r.error || 'Đăng nhập thất bại'); err.style.display = 'block'; }
+  } catch(e) { err.textContent = '❌ ' + e.message; err.style.display = 'block'; }
+  btn.disabled = false; btn.textContent = 'Đăng nhập';
 }
 
 async function doLogout() { await api('/api/logout', 'POST'); await refreshState(); }
@@ -1056,7 +1212,7 @@ function toggleConfig(key, el) {
 
 function saveBaseBet() {
   const v = parseInt(document.getElementById('inpBaseBet').value) || 10000;
-  api('/api/config', 'POST', { base_bet: v }).then(() => { state.base_bet = v; showToast('win', `💸 Vốn gốc: ${fmt(v)} Win`); });
+  api('/api/config', 'POST', { base_bet: v }).then(() => { state.base_bet = v; showToast('win', `Vốn gốc: ${fmt(v)} Win`); });
 }
 function setBet(v) { document.getElementById('inpBaseBet').value = v; saveBaseBet(); }
 function saveTarget() {
@@ -1079,20 +1235,20 @@ async function submitCode() {
   if (!code) return alert('Nhập code');
   await api('/api/config', 'POST', { lc79_jwt: jwt, lc79_api: endpoint, lc79_strip4: strip4 });
   const btn = document.getElementById('btnSubmitCode');
-  btn.disabled = true; btn.textContent = '⏳ Đang gửi...';
+  btn.disabled = true; btn.textContent = 'Đang gửi...';
   const r = await api('/api/code', 'POST', { code });
-  btn.disabled = false; btn.textContent = '📤 Submit code';
+  btn.disabled = false; btn.textContent = 'Submit code';
   if (r.ok) showToast('win', '✅ ' + (r.message || 'Code OK'));
   else showToast('lose', '❌ ' + (r.message || 'Code fail'));
 }
 
 function showLogin() {
-  document.getElementById('loginScreen').classList.remove('hidden');
-  document.getElementById('dashboard').classList.add('hidden');
+  document.getElementById('loginScreen').style.display = 'block';
+  document.getElementById('dashboard').style.display = 'none';
 }
 function showDashboard() {
-  document.getElementById('loginScreen').classList.add('hidden');
-  document.getElementById('dashboard').classList.remove('hidden');
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('dashboard').style.display = 'block';
   syncUI();
 }
 
@@ -1120,10 +1276,9 @@ function syncUI() {
   document.getElementById('currentBet').textContent = fmt(state.current_bet);
   document.getElementById('confVal').textContent = Math.round((state.current_confidence || 0) * 100) + '%';
   document.getElementById('confBar').style.width = Math.round((state.current_confidence || 0) * 100) + '%';
-  if (state.skip_reason) {
-    const sr = document.getElementById('skipReason');
-    sr.textContent = '🛑 ' + state.skip_reason; sr.classList.remove('hidden');
-  }
+  const sr = document.getElementById('skipReason');
+  if (state.skip_reason) { sr.textContent = '🛑 ' + state.skip_reason; sr.style.display = 'block'; }
+  else sr.style.display = 'none';
   if (state.logs && state.logs.length) {
     document.getElementById('logsBox').innerHTML = '';
     state.logs.forEach(appendLog);
@@ -1134,15 +1289,13 @@ function syncUI() {
 function renderPrediction() {
   const box = document.getElementById('predictionBox');
   if (!state.current_prediction) {
-    box.innerHTML = '<div class="text-4xl md:text-5xl font-black tracking-tight text-zinc-500">...</div><div class="text-xs text-zinc-500 mt-1 font-semibold">chờ session</div>';
+    box.innerHTML = '<div style="font-size: 28px; font-weight: 800; color: #71717a;">...</div><div style="font-size: 11px; color: #52525b; margin-top: 2px;">chờ session</div>';
     return;
   }
   const isTai = state.current_prediction === 'TAI';
   box.innerHTML = `
-    <div class="text-4xl md:text-5xl font-black tracking-tight ${isTai ? 'text-blue-400' : 'text-red-400'}">
-      ${isTai ? '🔵' : '🔴'} ${state.current_prediction}
-    </div>
-    <div class="text-xs ${isTai ? 'text-blue-300' : 'text-red-300'} mt-1 font-bold">AI CHỐT</div>
+    <div style="font-size: 30px; font-weight: 800; color: ${isTai ? '#3b82f6' : '#ef4444'};">${state.current_prediction}</div>
+    <div style="font-size: 11px; color: ${isTai ? '#93c5fd' : '#fca5a5'}; margin-top: 2px; font-weight: 700;">AI CHỐT</div>
   `;
 }
 
@@ -1150,20 +1303,20 @@ function renderStats() {
   const pl = state.profit_loss;
   const plEl = document.getElementById('cardPL');
   plEl.textContent = (pl >= 0 ? '+' : '') + fmt(pl);
-  plEl.className = 'text-base font-black mono ' + (pl >= 0 ? 'text-emerald-400' : 'text-red-400');
+  plEl.style.color = pl >= 0 ? '#10b981' : '#ef4444';
   document.getElementById('cardStreak').textContent = state.win_streak;
 }
 
 function renderResult(d) {
   const diceRow = document.getElementById('diceRow');
   const vals = d.dices || [0,0,0];
-  diceRow.innerHTML = vals.map((v,i) => `<div class="dice" style="animation-delay:${i*0.1}s">${v||'?'}</div>`).join('');
+  diceRow.innerHTML = vals.map(v => `<div class="dice">${v||'?'}</div>`).join('');
   const badge = document.getElementById('resultBadge');
   const isTai = d.result === 'TAI';
   if (d.result === 'TAI' || d.result === 'XIU') {
-    if (d.won === true) badge.innerHTML = `<span class="text-emerald-400">✅ THẮNG — ${isTai ? '🔵 TÀI' : '🔴 XỈU'}</span>`;
-    else if (d.won === false) badge.innerHTML = `<span class="text-red-400">❌ THUA — ${isTai ? '🔵 TÀI' : '🔴 XỈU'}</span>`;
-    else badge.innerHTML = `<span class="text-zinc-400">🎲 ${isTai ? '🔵 TÀI' : '🔴 XỈU'}</span>`;
+    if (d.won === true) badge.innerHTML = `<span style="color:#10b981;">✅ THẮNG — ${isTai ? 'TÀI' : 'XỈU'}</span>`;
+    else if (d.won === false) badge.innerHTML = `<span style="color:#ef4444;">❌ THUA — ${isTai ? 'TÀI' : 'XỈU'}</span>`;
+    else badge.innerHTML = `<span style="color:#a1a1aa;">${isTai ? 'TÀI' : 'XỈU'}</span>`;
   }
   renderHistory(d.history);
 }
@@ -1174,7 +1327,7 @@ function renderHistory(hist) {
   document.getElementById('historyCount').textContent = h.length;
   c.innerHTML = h.slice(-40).map(r => {
     const isTai = r === 'TAI';
-    return `<div class="history-bar ${isTai ? 'bar-tai' : 'bar-xiu'}" title="${r}">${isTai ? 'T' : 'X'}</div>`;
+    return `<div class="history-bar ${isTai ? 'bar-tai' : 'bar-xiu'}">${isTai ? 'T' : 'X'}</div>`;
   }).join('');
 }
 
@@ -1185,7 +1338,13 @@ async function refreshAI() {
     const max = d.top[0]?.[1] || 1;
     box.innerHTML = d.top.slice(0, 10).map(([name, w]) => {
       const pct = Math.round((w / max) * 100);
-      return `<div><div class="flex justify-between text-[11px] mb-1"><span class="font-bold text-zinc-300">${name}</span><span class="mono text-violet-400 font-bold">${w.toFixed(2)}</span></div><div class="h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-gradient-to-r from-violet-500 to-cyan-500 transition-all duration-500" style="width:${pct}%"></div></div></div>`;
+      return `<div>
+        <div style="display:flex; justify-content:space-between; font-size:11px; margin-bottom:3px;">
+          <span style="font-weight:700; color:#d4d4d8;">${name}</span>
+          <span class="mono" style="color:#a5b4fc; font-weight:700;">${w.toFixed(2)}</span>
+        </div>
+        <div class="progress"><div class="progress-fill" style="width:${pct}%;"></div></div>
+      </div>`;
     }).join('');
   } catch {}
 }
@@ -1203,9 +1362,9 @@ function appendLog(e) {
 function setStatus(ok, text) {
   const dot = document.getElementById('statusDot');
   const t = document.getElementById('statusText');
-  dot.className = 'w-2 h-2 rounded-full ' + (ok ? 'bg-emerald-400 shadow-lg shadow-emerald-400/60' : 'bg-zinc-500');
+  dot.className = 'status-dot' + (ok ? ' online' : '');
   t.textContent = text;
-  t.className = 'text-xs font-semibold ' + (ok ? 'text-emerald-400' : 'text-zinc-400');
+  t.style.color = ok ? '#10b981' : '#71717a';
 }
 
 function showToast(type, msg) {
@@ -1214,7 +1373,7 @@ function showToast(type, msg) {
   div.className = 'toast toast-' + type;
   div.textContent = msg;
   c.appendChild(div);
-  setTimeout(() => { div.style.transition = 'all 0.4s'; div.style.opacity = '0'; div.style.transform = 'translateX(120%)'; setTimeout(()=>div.remove(), 400); }, 4000);
+  setTimeout(() => { div.style.transition = 'opacity 0.3s'; div.style.opacity = '0'; setTimeout(()=>div.remove(), 300); }, 3500);
 }
 
 function fmt(n) { return (n || 0).toLocaleString('en-US'); }
@@ -1233,8 +1392,8 @@ document.addEventListener('DOMContentLoaded', () => {
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("=" * 60)
-    print("⚡ ULTRA VIP V4 — SINGLE FILE ONLINE")
+    print("⚡ ULTRA VIP V4 — CLEAN EDITION")
     print(f"   http://0.0.0.0:{port}")
-    print("   Features: 35 Cores · Live Accuracy · Confidence Gating · Kelly · Stop-Loss · Cooldown")
+    print("   Clean UI · No Zoom · Top-K Consensus · Confidence Gating")
     print("=" * 60)
     webio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
