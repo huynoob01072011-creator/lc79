@@ -1,7 +1,7 @@
 """
-⚡ ULTRA VIP V4 — Clean Edition
+⚡ ULTRA VIP V4 — Full Fixed Edition
 35 AI Cores · Live Accuracy · Confidence Gating · Kelly Sizing · Stop-Loss · Cooldown
-Web UI · LC79 Manual Code · Auto Bet
+Web UI · LC79 Manual Code · Auto Bet · Background Data Collector
 """
 import os, hashlib, base64, json, logging, threading, time, random, math
 import requests
@@ -25,6 +25,13 @@ logging.getLogger('urllib3').setLevel(logging.WARNING)
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'ultra-vip-v4-single-file')
 webio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_timeout=60)
+
+# ============================================================
+# BACKGROUND COLLECTOR CONFIG
+# ============================================================
+DATA_COLLECTOR_USER = os.environ.get('COLLECTOR_USER', 'acc_clone_soi_cau')
+DATA_COLLECTOR_PASS = os.environ.get('COLLECTOR_PASS', 'matkhau123')
+ENABLE_BG_COLLECTOR = os.environ.get('ENABLE_BG_COLLECTOR', '0') == '1'
 
 # ============================================================
 # GLOBAL STATE
@@ -52,6 +59,7 @@ MODEL_ACCURACY = {
 
 USERS = {}
 GAME_CLIENTS = {}
+_BG_THREAD_STARTED = False
 
 # ============================================================
 # USER STATE
@@ -74,6 +82,8 @@ def new_user_state(uid):
         'stop_loss': 500000,
         'skip_reason': None,
         'kelly_size': 0,
+        '_password': None,
+        '_is_bg': False,
     }
 
 def get_user():
@@ -83,14 +93,28 @@ def get_user():
     return USERS[uid], uid
 
 def add_log(uid, message, level='info'):
-    if uid not in USERS: return
-    ts = datetime.now().strftime('%H:%M:%S')
-    entry = {'ts': ts, 'msg': message, 'level': level}
-    USERS[uid]['logs'].append(entry)
-    webio.emit('log', entry, room=uid)
+    """Thread-safe log — không bao giờ raise."""
+    try:
+        if uid not in USERS: return
+        ts = datetime.now().strftime('%H:%M:%S')
+        entry = {'ts': ts, 'msg': message, 'level': level}
+        USERS[uid]['logs'].append(entry)
+        try:
+            webio.emit('log', entry, room=uid)
+        except Exception as e:
+            logger.debug(f"webio.emit log skipped: {e}")
+    except Exception as e:
+        logger.debug(f"add_log skipped: {e}")
+
+def safe_emit(event, data, uid):
+    """Thread-safe emit — không bao giờ raise."""
+    try:
+        webio.emit(event, data, room=uid)
+    except Exception as e:
+        logger.debug(f"safe_emit {event} skipped: {e}")
 
 # ============================================================
-# 35 AI CORES (base models)
+# 35 AI CORES
 # ============================================================
 def compute_all_models(history):
     mp = {}
@@ -166,13 +190,9 @@ def compute_all_models(history):
 
 
 # ============================================================
-# V4 PREDICTION + CONFIDENCE (NÂNG CẤP SIÊU CHUẨN)
+# V4 PREDICTION + CONFIDENCE
 # ============================================================
 def make_prediction(uid):
-    """
-    Returns (pred, confidence, details)
-    Nâng cấp: weighting mũ bậc 2 + Top-K Consensus + phạt đồng thuận yếu.
-    """
     state = USERS[uid]
     history = list(GLOBAL_HISTORY)
 
@@ -192,7 +212,6 @@ def make_prediction(uid):
         base_w = GLOBAL_AI_WEIGHTS.get(m, 1.0)
         if acc['rec_total'] >= 8:
             rec_acc = acc['rec_correct'] / acc['rec_total']
-            # Ưu tiên mạnh model có accuracy thực cao
             acc_factor = max(0.15, (rec_acc ** 2) * 2.5)
         else:
             acc_factor = 0.6
@@ -211,15 +230,12 @@ def make_prediction(uid):
     margin = (score[pred] - score[other]) / total_w
     agree_pct = vote_count[pred] / len(model_preds)
 
-    # Top-K consensus: lấy 7 model có trọng số cao nhất, xem có đồng thuận
     top_models = sorted(reliabilities.items(), key=lambda x: x[1], reverse=True)[:7]
     top_agree = sum(1 for m, _ in top_models if model_preds[m] == pred)
     top_consensus = top_agree / max(1, len(top_models))
 
-    # Confidence = kết hợp margin + agree + top consensus
     confidence = 0.45 * margin + 0.35 * agree_pct + 0.20 * top_consensus
 
-    # Phạt khi đồng thuận yếu
     if top_consensus < 0.70:
         confidence *= 0.75
     if agree_pct < 0.60:
@@ -239,7 +255,6 @@ def make_prediction(uid):
 
 
 def update_ai_weights(actual_result, uid=None):
-    """Cập nhật trọng số dựa trên live accuracy (cửa sổ trượt 30)"""
     global GLOBAL_AI_WEIGHTS
     preds = None
     if uid and uid in USERS:
@@ -309,7 +324,7 @@ def calculate_bet_size(uid):
 
 
 # ============================================================
-# TELE68 LOGIN & WEBSOCKET
+# TELE68 LOGIN
 # ============================================================
 def md5(s): return hashlib.md5(s.encode()).hexdigest()
 
@@ -339,25 +354,53 @@ def login_tele68(username, password):
         return {"_error": f"Lỗi kết nối: {e}"}
 
 
-def start_game_ws(uid):
+# ============================================================
+# GAME WEBSOCKET — FULL FIX với retry + diagnostics
+# ============================================================
+def start_game_ws(uid, attempt=1, max_attempts=3):
+    state = USERS.get(uid)
+    if not state:
+        logger.warning(f"start_game_ws: uid {uid} không tồn tại")
+        return
+    if not state.get('token'):
+        add_log(uid, "❌ Không có token — hãy đăng nhập lại", 'error')
+        return
+
+    tok = state['token']
+    is_bg = state.get('_is_bg', False)
+    add_log(uid, f"🔑 Token len={len(tok)} · {tok[:24]}... · attempt {attempt}/{max_attempts}", 'info')
+
+    # Dọn kết nối cũ
     if uid in GAME_CLIENTS:
         try: GAME_CLIENTS[uid].disconnect()
         except: pass
+        GAME_CLIENTS.pop(uid, None)
 
-    state = USERS[uid]
-    client = sio_client.Client(reconnection=True, reconnection_attempts=20, logger=False, engineio_logger=False)
+    client = sio_client.Client(
+        reconnection=True,
+        reconnection_attempts=3,
+        logger=False,
+        engineio_logger=False,
+    )
     GAME_CLIENTS[uid] = client
 
+    # ---------- CONNECT HANDLERS ----------
     @client.event(namespace='/txmd5')
     def connect():
-        add_log(uid, "✅ Đã kết nối WebSocket game", 'success')
-        webio.emit('status', {'connected': True}, room=uid)
+        add_log(uid, "✅ WS /txmd5 đã kết nối!", 'success')
+        safe_emit('status', {'connected': True}, uid)
+
+    @client.event(namespace='/txmd5')
+    def connect_error(data):
+        add_log(uid, f"❌ WS connect_error: {data}", 'error')
+        safe_emit('status', {'connected': False, 'error': str(data)}, uid)
 
     @client.event(namespace='/txmd5')
     def disconnect():
-        add_log(uid, "⚠️ Mất kết nối WebSocket", 'warn')
-        webio.emit('status', {'connected': False}, room=uid)
+        add_log(uid, "⚠️ WS đã ngắt kết nối", 'warn')
+        safe_emit('status', {'connected': False}, uid)
 
+    # ---------- GAME EVENTS ----------
     @client.on('new-session', namespace='/txmd5')
     def on_new_session(data):
         state['session_id'] = data.get('id', '?')
@@ -397,7 +440,7 @@ def start_game_ws(uid):
             state['current_bet'] = calculate_bet_size(uid) or state['base_bet']
         state['kelly_size'] = state['current_bet']
 
-        webio.emit('new_session', {
+        safe_emit('new_session', {
             'session_id': state['session_id'],
             'prediction': state['current_prediction'],
             'confidence': round(state['current_confidence'], 3),
@@ -405,7 +448,7 @@ def start_game_ws(uid):
             'current_bet': state['current_bet'],
             'skip_reason': state['skip_reason'],
             'history_len': len(GLOBAL_HISTORY),
-        }, room=uid)
+        }, uid)
 
     @client.on('tick-update', namespace='/txmd5')
     def on_tick(data):
@@ -419,10 +462,10 @@ def start_game_ws(uid):
                     state['has_bet_this_session'] = True
                     state['waiting_for_result'] = True
                     add_log(uid, f"🚀 Đặt {state['current_bet']:,} Win → {state['current_prediction']}", 'bet')
-                    webio.emit('bet_placed', {
+                    safe_emit('bet_placed', {
                         'amount': state['current_bet'],
                         'type': state['current_prediction'],
-                    }, room=uid)
+                    }, uid)
                 except Exception as e:
                     add_log(uid, f"❌ Lỗi đặt cược: {e}", 'error')
 
@@ -430,7 +473,7 @@ def start_game_ws(uid):
     def on_bet_result(data):
         if "postBalance" in data:
             state['balance'] = data["postBalance"]
-            webio.emit('balance', {'balance': state['balance']}, room=uid)
+            safe_emit('balance', {'balance': state['balance']}, uid)
         client.emit('get-current-my-info', None, namespace='/txmd5')
 
     @client.on('session-result', namespace='/txmd5')
@@ -455,10 +498,10 @@ def start_game_ws(uid):
                 state['consecutive_losses'] = 0
                 add_log(uid, f"✅ THẮNG {result} — +{win_amt:,} Win (streak {state['win_streak']})", 'win')
                 if state['notify_win']:
-                    webio.emit('notify', {
+                    safe_emit('notify', {
                         'type': 'win', 'amount': win_amt, 'result': result,
                         'dices': dices, 'streak': state['win_streak'],
-                    }, room=uid)
+                    }, uid)
             else:
                 state['profit_loss'] -= state['current_bet']
                 state['win_streak'] = 0
@@ -469,13 +512,13 @@ def start_game_ws(uid):
                     add_log(uid, "🛑 THUA 3 liên tiếp → nghỉ 5 phiên", 'warn')
                 add_log(uid, f"❌ THUA {result} — -{state['current_bet']:,} Win", 'lose')
                 if state['notify_lose']:
-                    webio.emit('notify', {
+                    safe_emit('notify', {
                         'type': 'lose', 'amount': -state['current_bet'],
                         'result': result, 'dices': dices,
-                    }, room=uid)
+                    }, uid)
             state['waiting_for_result'] = False
 
-        webio.emit('result', {
+        safe_emit('result', {
             'result': result, 'dices': dices,
             'prediction': prediction, 'won': won,
             'profit_loss': state['profit_loss'],
@@ -484,21 +527,95 @@ def start_game_ws(uid):
             'consecutive_losses': state['consecutive_losses'],
             'cooldown_remaining': state['cooldown_remaining'],
             'history': list(GLOBAL_HISTORY)[-40:],
-        }, room=uid)
+        }, uid)
 
-    try:
-        client.connect(
-            'https://wtxmd52.tele68.com',
-            socketio_path='txmd5/',
-            namespaces=['/txmd5'],
-            transports=['websocket'],
-            auth={"token": state['token']},
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        client.wait()
-    except Exception as e:
-        add_log(uid, f"❌ Lỗi WS: {e}", 'error')
-        webio.emit('status', {'connected': False}, room=uid)
+    # ---------- CONNECT với fallback transports ----------
+    transports_list = [['websocket']]
+    if attempt >= 2:
+        transports_list = [['polling', 'websocket'], ['websocket']]
+        add_log(uid, "🔄 Thử fallback transports polling+websocket", 'warn')
+
+    ok = False
+    for transports in transports_list:
+        try:
+            add_log(uid, f"🔌 Connecting transports={transports}...", 'info')
+            client.connect(
+                'https://wtxmd52.tele68.com',
+                socketio_path='txmd5/',
+                namespaces=['/txmd5'],
+                transports=transports,
+                auth={"token": tok},
+                headers={"User-Agent": "Mozilla/5.0"},
+                wait_timeout=15,
+            )
+            ok = True
+            add_log(uid, "✅ Namespace /txmd5 OK", 'success')
+            break
+        except Exception as e:
+            add_log(uid, f"❌ Fail ({transports}): {e}", 'error')
+            try: client.disconnect()
+            except: pass
+            time.sleep(1.5)
+
+    if ok:
+        try:
+            client.wait()
+        except Exception as e:
+            add_log(uid, f"⚠️ wait error: {e}", 'warn')
+
+    # ---------- Retry nếu fail ----------
+    if not ok:
+        GAME_CLIENTS.pop(uid, None)
+        if attempt < max_attempts and not is_bg:
+            delay = 3 * attempt
+            add_log(uid, f"🔄 Retry {attempt+1}/{max_attempts} sau {delay}s...", 'warn')
+            time.sleep(delay)
+            start_game_ws(uid, attempt + 1, max_attempts)
+        elif not is_bg:
+            add_log(uid, "❌ WS thất bại sau nhiều lần — hãy logout → login lại", 'error')
+            safe_emit('status', {'connected': False, 'error': 'WS failed after retries'}, uid)
+
+
+# ============================================================
+# BACKGROUND DATA COLLECTOR
+# ============================================================
+def background_data_collector():
+    """Login acc riêng, giữ WS sống để tích lũy GLOBAL_HISTORY 24/7."""
+    global _BG_THREAD_STARTED
+    if _BG_THREAD_STARTED:
+        return
+    _BG_THREAD_STARTED = True
+
+    if not ENABLE_BG_COLLECTOR:
+        logger.info("ℹ️ Background collector TẮT (set ENABLE_BG_COLLECTOR=1 để bật)")
+        return
+
+    logger.info("🌐 Background collector đang khởi động...")
+    bg_uid = "_bg_collector"
+
+    while True:
+        try:
+            if bg_uid not in USERS:
+                USERS[bg_uid] = new_user_state(bg_uid)
+            bg = USERS[bg_uid]
+            bg['_is_bg'] = True
+
+            res = login_tele68(DATA_COLLECTOR_USER, DATA_COLLECTOR_PASS)
+            if 'token' in res:
+                bg['token'] = res['token']
+                bg['nickname'] = res.get('nickname')
+                bg['logged_in'] = True
+                logger.info(f"✅ BG collector login OK: {res.get('nickname')}")
+                try:
+                    start_game_ws(bg_uid)
+                except Exception as e:
+                    logger.warning(f"BG WS error: {e}")
+            else:
+                logger.warning(f"BG login fail: {res.get('_error')}")
+        except Exception as e:
+            logger.warning(f"BG collector error: {e}")
+        time.sleep(30)
+
 
 # ============================================================
 # LC79 CODE
@@ -527,12 +644,14 @@ def submit_lc79_code(jwt, code, api_url):
     except Exception as e:
         return {"ok": False, "message": f"Lỗi request: {e}"}
 
+
 # ============================================================
 # ROUTES
 # ============================================================
 @app.route('/')
 def index():
     return Response(HTML_PAGE, mimetype='text/html')
+
 
 @app.route('/api/state', methods=['GET'])
 def api_state():
@@ -560,6 +679,7 @@ def api_state():
         'confidence_details': u.get('confidence_details', {}),
     })
 
+
 @app.route('/api/login', methods=['POST'])
 def api_login():
     u, uid = get_user()
@@ -569,12 +689,19 @@ def api_login():
     if not username or not password:
         return jsonify({'ok': False, 'error': 'Thiếu tài khoản hoặc mật khẩu'}), 400
 
+    # Ngắt WS cũ nếu có
+    if uid in GAME_CLIENTS:
+        try: GAME_CLIENTS[uid].disconnect()
+        except: pass
+        GAME_CLIENTS.pop(uid, None)
+
     add_log(uid, f"🔄 Đang đăng nhập {username}...", 'info')
     result = login_tele68(username, password)
     if '_error' in result:
         add_log(uid, f"❌ Login fail: {result['_error']}", 'error')
         return jsonify({'ok': False, 'error': result['_error']}), 400
 
+    # Set toàn bộ state TRƯỚC khi start thread
     u['token'] = result['token']
     u['nickname'] = result['nickname']
     u['balance'] = result['money']
@@ -583,10 +710,14 @@ def api_login():
     u['win_streak'] = 0
     u['consecutive_losses'] = 0
     u['cooldown_remaining'] = 0
+    u['_password'] = password
+    u['_is_bg'] = False
+
     add_log(uid, f"✅ Login OK: {result['nickname']} — {result['money']:,} Win", 'success')
 
     threading.Thread(target=start_game_ws, args=(uid,), daemon=True).start()
     return jsonify({'ok': True, 'nickname': result['nickname'], 'balance': result['money']})
+
 
 @app.route('/api/logout', methods=['POST'])
 def api_logout():
@@ -600,6 +731,7 @@ def api_logout():
     u['token'] = None
     add_log(uid, "🔌 Đã đăng xuất", 'warn')
     return jsonify({'ok': True})
+
 
 @app.route('/api/config', methods=['POST'])
 def api_config():
@@ -638,6 +770,7 @@ def api_config():
         'base_bet': u['base_bet'], 'auto_bet_enabled': u['auto_bet_enabled'], 'x2_mode': u['x2_mode'],
     }})
 
+
 @app.route('/api/code', methods=['POST'])
 def api_code():
     u, uid = get_user()
@@ -651,10 +784,23 @@ def api_code():
     else: add_log(uid, f"❌ LC79 fail: {res['message']}", 'error')
     return jsonify(res)
 
+
 @app.route('/api/ai', methods=['GET'])
 def api_ai():
     top = sorted(GLOBAL_AI_WEIGHTS.items(), key=lambda x: x[1], reverse=True)[:20]
     return jsonify({'top': top, 'history_len': len(GLOBAL_HISTORY)})
+
+
+@app.route('/api/reconnect', methods=['POST'])
+def api_reconnect():
+    """Manual reconnect WS."""
+    u, uid = get_user()
+    if not u['token']:
+        return jsonify({'ok': False, 'error': 'Chưa login'}), 400
+    add_log(uid, "🔄 Manual reconnect...", 'info')
+    threading.Thread(target=start_game_ws, args=(uid,), daemon=True).start()
+    return jsonify({'ok': True})
+
 
 # ============================================================
 # SOCKETIO
@@ -665,6 +811,7 @@ def on_ws_connect(auth=None):
     join_room(uid)
     if uid not in USERS:
         USERS[uid] = new_user_state(uid)
+
 
 # ============================================================
 # HTML PAGE (CLEAN + NO-ZOOM)
@@ -900,10 +1047,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <section id="dashboard" style="display: none;">
   <div style="display: grid; grid-template-columns: 1fr; gap: 16px;" id="dashGrid">
 
-    <!-- LEFT COLUMN -->
     <div style="display: flex; flex-direction: column; gap: 16px;">
-
-      <!-- Account card -->
       <div class="card">
         <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
           <div style="display: flex; align-items: center; gap: 12px;">
@@ -913,7 +1057,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <div style="font-size: 17px; font-weight: 800; line-height: 1.2;" id="nickname">-</div>
             </div>
           </div>
-          <button onclick="doLogout()" class="btn btn-ghost" style="font-size: 12px; padding: 8px 14px;">Đăng xuất</button>
+          <div style="display: flex; gap: 8px;">
+            <button onclick="doReconnect()" class="btn btn-ghost" style="font-size: 12px; padding: 8px 14px;">Reconnect</button>
+            <button onclick="doLogout()" class="btn btn-ghost" style="font-size: 12px; padding: 8px 14px;">Đăng xuất</button>
+          </div>
         </div>
         <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 16px;">
           <div style="background: #0a0a12; border: 1px solid #232330; border-radius: 8px; padding: 10px; text-align: center;">
@@ -931,7 +1078,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Prediction card -->
       <div class="card">
         <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px;">
           <div>
@@ -977,7 +1123,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div id="resultBadge" style="text-align: center; margin-top: 8px; font-size: 13px; font-weight: 700; color: #71717a;">Chờ kết quả...</div>
       </div>
 
-      <!-- History -->
       <div class="card">
         <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
           <div>
@@ -993,10 +1138,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- RIGHT COLUMN -->
     <div style="display: flex; flex-direction: column; gap: 16px;">
 
-      <!-- Config -->
       <div class="card">
         <h3 class="label-xs" style="margin: 0 0 14px;">Cấu hình bot</h3>
 
@@ -1048,7 +1191,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- LC79 -->
       <div class="card">
         <h3 class="label-xs" style="margin: 0 0 12px;">Nhập code LC79</h3>
         <div style="display: flex; flex-direction: column; gap: 10px;">
@@ -1072,7 +1214,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Logs -->
       <div class="card">
         <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
           <h3 class="label-xs" style="margin: 0;">Logs</h3>
@@ -1081,7 +1222,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div id="logsBox" class="scroll" style="max-height: 300px; overflow-y: auto; padding-right: 2px;"></div>
       </div>
 
-      <!-- AI Weights -->
       <div class="card">
         <h3 class="label-xs" style="margin: 0 0 10px;">Top AI Cores</h3>
         <div id="aiWeights" style="display: flex; flex-direction: column; gap: 6px;"></div>
@@ -1128,7 +1268,10 @@ const socket = io({ query: { client_id: CLIENT_ID }, transports: ['websocket','p
 socket.on('connect', () => { setStatus(true, 'Đã kết nối'); refreshState(); });
 socket.on('disconnect', () => setStatus(false, 'Mất kết nối'));
 socket.on('log', (e) => appendLog(e));
-socket.on('status', (d) => setStatus(d.connected, d.connected ? 'Game online' : 'Game offline'));
+socket.on('status', (d) => {
+  if (d.connected) setStatus(true, 'Game online');
+  else setStatus(false, d.error ? ('Lỗi: ' + d.error).slice(0, 40) : 'Game offline');
+});
 
 socket.on('new_session', (d) => {
   state.session_id = d.session_id;
@@ -1200,6 +1343,12 @@ async function doLogin() {
 }
 
 async function doLogout() { await api('/api/logout', 'POST'); await refreshState(); }
+
+async function doReconnect() {
+  const r = await api('/api/reconnect', 'POST');
+  if (r.ok) showToast('win', '🔄 Đang reconnect WS...');
+  else showToast('lose', '❌ ' + (r.error || 'Reconnect fail'));
+}
 
 function toggleConfig(key, el) {
   const newVal = !state[key];
@@ -1386,14 +1535,20 @@ document.addEventListener('DOMContentLoaded', () => {
 </body>
 </html>"""
 
+
 # ============================================================
 # RUN
 # ============================================================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("=" * 60)
-    print("⚡ ULTRA VIP V4 — CLEAN EDITION")
+    print("⚡ ULTRA VIP V4 — FULL FIXED EDITION")
     print(f"   http://0.0.0.0:{port}")
+    print(f"   Background Collector: {'BẬT' if ENABLE_BG_COLLECTOR else 'TẮT'}")
     print("   Clean UI · No Zoom · Top-K Consensus · Confidence Gating")
     print("=" * 60)
+
+    # Khởi động background collector (nếu bật)
+    threading.Thread(target=background_data_collector, daemon=True).start()
+
     webio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
