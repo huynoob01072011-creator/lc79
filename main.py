@@ -1,5 +1,5 @@
 # ============================================================================
-#  LC79 AUTO REDEEM - WEB EDITION
+#  LC79 AUTO REDEEM - WEB EDITION (fixed login: MD5 + sessionKey decode)
 #  Deploy: gunicorn --workers=1 --threads=8 --timeout=0 --bind=0.0.0.0:$PORT main:app
 # ============================================================================
 import os
@@ -8,6 +8,7 @@ import time
 import json
 import base64
 import random
+import hashlib
 import asyncio
 import threading
 from collections import deque
@@ -59,9 +60,16 @@ def log(msg, level="info"):
 # ----------------------------------------------------------------------------
 # Game account
 # ----------------------------------------------------------------------------
+def md5_hash(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
 class Account:
     def __init__(self, un, pw, nick):
-        self.un, self.pw, self.nick = un, pw, nick
+        self.un = un
+        self.pw = pw
+        self.nick = nick                    # nick hiển thị trong log
+        self.real_nick = None               # nick thật từ sessionKey
         self.used_codes = set()
         self.lock = threading.Lock()
         self.jwt = None
@@ -93,19 +101,38 @@ class Account:
         return self.jwt is not None and time.time() < (self.jwt_exp - 60)
 
     def get_access_token(self):
+        """Login game → accessToken + decode sessionKey lấy real_nick."""
+        pw_md5 = md5_hash(self.pw)
         try:
             with requests.Session() as s:
                 res = s.get(
                     "https://apifo88daigia.tele68.com/api",
-                    params={"c": "3", "un": self.un, "pw": self.pw,
+                    params={"c": "3", "un": self.un, "pw": pw_md5,
                             "cp": "R", "cl": "R", "pf": "web", "at": ""},
                     headers=self._headers(), timeout=(5, 45),
                 )
             data = res.json()
-            if data.get("success"):
-                return data.get("accessToken")
-            log(f"[{self.nick}] ❌ get_access_token fail: {data}", "error")
-            return None
+
+            if not data.get("success"):
+                msg = data.get("message") or f"errorCode={data.get('errorCode')}"
+                log(f"[{self.nick}] ❌ login game fail: {msg}", "error")
+                return None
+
+            # Decode sessionKey → lấy nickname thật từ server
+            session_key = data.get("sessionKey") or ""
+            if session_key:
+                sk = session_key + "=" * ((4 - len(session_key) % 4) % 4)
+                try:
+                    session_data = json.loads(base64.b64decode(sk).decode("utf-8"))
+                    self.real_nick = (session_data.get("nickname")
+                                      or session_data.get("nickName")
+                                      or self.real_nick)
+                    if self.real_nick and self.real_nick != self.nick:
+                        log(f"[{self.nick}] 🔎 Real nick: {self.real_nick}", "info")
+                except Exception as e:
+                    log(f"[{self.nick}] ⚠️ Decode sessionKey fail: {e}", "warn")
+
+            return data.get("accessToken")
         except Exception as e:
             log(f"[{self.nick}] ❌ get_access_token: {e}", "error")
             return None
@@ -114,18 +141,21 @@ class Account:
         at = self.get_access_token()
         if not at:
             return False
+
+        nick_for_login = self.real_nick or self.nick
         try:
             with requests.Session() as s:
                 res = s.post(
-                    "https://wlb.tele68.com/v1/lobby/auth/login",
+                    "https://wlb.tele68.com/v1/lobby/auth/login?cp=R&cl=R&pf=web&at=",
                     headers={
+                        "authority": "wlb.tele68.com",
                         "content-type": "application/json",
                         "origin": "https://lc79b.bet",
                         "referer": "https://lc79b.bet/",
                         "user-agent": "Mozilla/5.0",
                         "connection": "close",
                     },
-                    json={"nickName": self.nick, "accessToken": at},
+                    json={"nickName": nick_for_login, "accessToken": at},
                     timeout=(5, 45),
                 )
             data = res.json()
@@ -134,9 +164,11 @@ class Account:
                 self.jwt = tok
                 self.jwt_exp = self.parse_jwt_exp(tok)
                 remain = int((self.jwt_exp - time.time()) / 60) if self.jwt_exp else 0
-                log(f"[{self.nick}] ✅ JWT OK (còn {remain} phút)", "success")
+                money = (data.get("remoteLoginResp") or {}).get("money")
+                extra = f" | 💰 {int(money):,}" if money else ""
+                log(f"[{self.nick}] ✅ JWT OK (còn {remain} phút){extra}", "success")
                 return True
-            log(f"[{self.nick}] ❌ login fail: {data}", "error")
+            log(f"[{self.nick}] ❌ lobby login fail: {data}", "error")
             return False
         except Exception as e:
             log(f"[{self.nick}] ❌ refresh_token: {e}", "error")
@@ -579,7 +611,7 @@ def _run_bot():
 
 
 # ----------------------------------------------------------------------------
-# Frontend (embedded)
+# Frontend
 # ----------------------------------------------------------------------------
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="vi">
@@ -593,10 +625,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 :root{
-  --bg:#0a0e1a;--bg2:#131a2e;--card:rgba(255,255,255,.03);--border:rgba(255,255,255,.08);
+  --bg:#0a0e1a;--card:rgba(255,255,255,.03);--border:rgba(255,255,255,.08);
   --text:#e2e8f0;--dim:#94a3b8;--muted:#64748b;
-  --primary:#6366f1;--primary-h:#4f46e5;
-  --success:#10b981;--danger:#ef4444;--warn:#f59e0b;
+  --primary:#6366f1;--success:#10b981;--danger:#ef4444;--warn:#f59e0b;
 }
 html,body{height:100%;overflow-x:hidden;-webkit-text-size-adjust:100%}
 body{
@@ -608,11 +639,9 @@ body{
   min-height:100vh;padding-bottom:env(safe-area-inset-bottom)
 }
 button{font:inherit;cursor:pointer;border:none;outline:none;background:none;color:inherit}
-input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
+input{font:inherit;-webkit-appearance:none;appearance:none}
 .app{max-width:1200px;margin:0 auto;padding:20px}
 @media(max-width:640px){.app{padding:12px}}
-
-/* Header */
 .header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
 .brand{display:flex;align-items:center;gap:12px}
 .brand-icon{font-size:36px;filter:drop-shadow(0 4px 12px rgba(99,102,241,.5))}
@@ -629,25 +658,18 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
 .badge .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
 .badge.on .dot{background:var(--success);box-shadow:0 0 8px var(--success);animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
-
-/* Stats */
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
 @media(max-width:640px){.stats{grid-template-columns:repeat(2,1fr)}}
 .stat{background:linear-gradient(135deg,rgba(255,255,255,.04),rgba(255,255,255,.01));
-  border:1px solid var(--border);border-radius:14px;padding:14px;
-  backdrop-filter:blur(8px)}
+  border:1px solid var(--border);border-radius:14px;padding:14px;backdrop-filter:blur(8px)}
 .stat-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
 .stat-value{font:600 14px/1.4 "SF Mono",Consolas,monospace;color:var(--text);margin-top:6px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .stat-value.ok{color:#6ee7b7}
 .stat-value.no{color:#fca5a5}
-
-/* Grid */
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
 @media(max-width:900px){.grid{grid-template-columns:1fr}}
 .col{display:flex;flex-direction:column;gap:20px}
-
-/* Card */
 .card{background:linear-gradient(135deg,rgba(255,255,255,.04),rgba(255,255,255,.01));
   border:1px solid var(--border);border-radius:16px;padding:20px;
   backdrop-filter:blur(12px);box-shadow:0 4px 24px rgba(0,0,0,.2)}
@@ -655,8 +677,6 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
 .card-title span{font-size:18px}
 .card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
 .card-header .card-title{margin:0}
-
-/* Form */
 .field{margin-bottom:14px}
 .label{display:block;font-size:12px;font-weight:500;color:var(--dim);margin-bottom:6px}
 .input{width:100%;padding:12px 14px;font-size:16px;color:var(--text);
@@ -665,9 +685,6 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
 .input::placeholder{color:var(--muted)}
 .input:focus{outline:none;border-color:var(--primary);
   box-shadow:0 0 0 3px rgba(99,102,241,.15);background:rgba(0,0,0,.5)}
-.input:disabled{opacity:.5;cursor:not-allowed}
-
-/* Buttons */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;
   padding:12px 18px;font-size:14px;font-weight:600;border-radius:10px;
   min-height:44px;cursor:pointer;user-select:none;white-space:nowrap;
@@ -677,37 +694,28 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
   box-shadow:0 4px 14px rgba(99,102,241,.35)}
 .btn-primary:hover:not(:disabled){background:linear-gradient(135deg,#4f46e5,#7c3aed);
   box-shadow:0 6px 20px rgba(99,102,241,.55);transform:translateY(-1px)}
-.btn-primary:active:not(:disabled){transform:translateY(0)}
 .btn-success{background:linear-gradient(135deg,#10b981,#059669);color:#fff;
   box-shadow:0 4px 14px rgba(16,185,129,.3)}
 .btn-success:hover:not(:disabled){background:linear-gradient(135deg,#059669,#047857);transform:translateY(-1px)}
 .btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;
   box-shadow:0 4px 14px rgba(239,68,68,.3)}
 .btn-danger:hover:not(:disabled){background:linear-gradient(135deg,#dc2626,#b91c1c);transform:translateY(-1px)}
-.btn-secondary{background:rgba(255,255,255,.06);color:var(--text);
-  border:1px solid var(--border)}
+.btn-secondary{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--border)}
 .btn-secondary:hover:not(:disabled){background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.2)}
 .btn-block{width:100%}
 .btn-sm{padding:8px 14px;font-size:13px;min-height:38px}
 .btn-group{display:flex;gap:10px}
 .btn-group>.btn{flex:1}
-.btn-text{color:var(--dim);font-size:12px;font-weight:500;padding:4px 8px;border-radius:6px;
-  transition:all .15s}
+.btn-text{color:var(--dim);font-size:12px;font-weight:500;padding:4px 8px;border-radius:6px;transition:all .15s}
 .btn-text:hover{color:var(--text);background:rgba(255,255,255,.05)}
 .input-group{display:flex;gap:8px}
 .input-group .input{flex:1}
 .input-group .btn{padding:12px 16px;flex-shrink:0}
-
-/* Spinner */
 .spinner{display:inline-block;width:14px;height:14px;
   border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;
   animation:spin .6s linear infinite;vertical-align:middle}
 @keyframes spin{to{transform:rotate(360deg)}}
-
-/* Hidden */
 .hidden{display:none!important}
-
-/* Account list */
 .acc-list{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
 .acc-row{display:grid;grid-template-columns:1fr 1fr 1fr 36px;gap:6px;align-items:center}
 .acc-row .input{padding:10px 10px;font-size:14px;min-height:40px}
@@ -717,8 +725,6 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
 .acc-remove:hover{background:rgba(239,68,68,.25);color:#fff}
 @media(max-width:520px){.acc-row{grid-template-columns:1fr 1fr 36px}
   .acc-row .acc-nick{grid-column:1/3}}
-
-/* Logs */
 .logs{background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.05);border-radius:10px;
   padding:12px;height:340px;overflow-y:auto;font:11px/1.5 "SF Mono",Consolas,monospace;
   scroll-behavior:smooth}
@@ -732,8 +738,6 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
 .log-success{color:#6ee7b7}
 .log-error{color:#fca5a5}
 .log-warn{color:#fcd34d}
-
-/* Toast */
 .toasts{position:fixed;top:16px;right:16px;z-index:9999;display:flex;
   flex-direction:column;gap:8px;pointer-events:none}
 @media(max-width:640px){.toasts{left:16px;right:16px}}
@@ -744,17 +748,13 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
 .toast.error{background:linear-gradient(135deg,#991b1b,#7f1d1d);border-color:rgba(239,68,68,.5)}
 .toast.warn{background:linear-gradient(135deg,#92400e,#78350f);border-color:rgba(245,158,11,.5)}
 @keyframes toastIn{from{transform:translateX(400px);opacity:0}to{transform:translateX(0);opacity:1}}
-
-/* Footer */
 .footer{text-align:center;font-size:12px;color:var(--muted);margin-top:32px;padding:16px 0}
 </style>
 </head>
 <body>
-
 <div id="toasts" class="toasts"></div>
 
 <div class="app">
-
   <header class="header">
     <div class="brand">
       <div class="brand-icon">🎁</div>
@@ -770,31 +770,16 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
   </header>
 
   <div class="stats">
-    <div class="stat">
-      <div class="stat-label">Telegram</div>
-      <div class="stat-value" id="stat-user">—</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Group ID</div>
-      <div class="stat-value" id="stat-group">—</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Accounts</div>
-      <div class="stat-value" id="stat-acc">0</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Session</div>
-      <div class="stat-value" id="stat-session">❌</div>
-    </div>
+    <div class="stat"><div class="stat-label">Telegram</div><div class="stat-value" id="stat-user">—</div></div>
+    <div class="stat"><div class="stat-label">Group ID</div><div class="stat-value" id="stat-group">—</div></div>
+    <div class="stat"><div class="stat-label">Accounts</div><div class="stat-value" id="stat-acc">0</div></div>
+    <div class="stat"><div class="stat-label">Session</div><div class="stat-value" id="stat-session">❌</div></div>
   </div>
 
   <div class="grid">
     <div class="col">
-
-      <!-- Login card -->
       <div class="card">
         <h2 class="card-title"><span>🔐</span> Đăng nhập Telegram</h2>
-
         <div id="step1">
           <div class="field">
             <label class="label">API ID</label>
@@ -808,11 +793,8 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
             <label class="label">Số điện thoại</label>
             <input id="phone" type="tel" class="input" placeholder="+84..." inputmode="tel" autocomplete="tel" />
           </div>
-          <button type="button" class="btn btn-primary btn-block" onclick="sendOTP(this)">
-            📱 Gửi mã OTP
-          </button>
+          <button type="button" class="btn btn-primary btn-block" onclick="sendOTP(this)">📱 Gửi mã OTP</button>
         </div>
-
         <div id="step2" class="hidden">
           <div class="field">
             <label class="label">Mã OTP</label>
@@ -827,18 +809,14 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
             <button type="button" class="btn btn-primary" onclick="verifyOTP(this)">✅ Xác nhận</button>
           </div>
         </div>
-
         <div id="loggedIn" class="hidden">
           <p style="color:var(--dim);font-size:13px;margin-bottom:12px">
-            ✅ Đã đăng nhập. Session được lưu server — không cần nhập lại nếu restart (thêm env).
+            ✅ Đã đăng nhập. Session được lưu server — thêm env TELEGRAM_SESSION để không cần nhập lại.
           </p>
-          <button type="button" class="btn btn-secondary btn-block" onclick="logout(this)">
-            🚪 Đăng xuất
-          </button>
+          <button type="button" class="btn btn-secondary btn-block" onclick="logout(this)">🚪 Đăng xuất</button>
         </div>
       </div>
 
-      <!-- Config card -->
       <div class="card">
         <h2 class="card-title"><span>⚙️</span> Cấu hình</h2>
         <div class="field">
@@ -848,35 +826,26 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
         <div class="field">
           <label class="label">Accounts game LC79</label>
           <div id="accountList" class="acc-list"></div>
-          <button type="button" class="btn btn-secondary btn-block btn-sm" onclick="addAccount()">
-            ➕ Thêm account
-          </button>
+          <button type="button" class="btn btn-secondary btn-block btn-sm" onclick="addAccount()">➕ Thêm account</button>
         </div>
-        <button type="button" class="btn btn-primary btn-block" onclick="saveConfig(this)">
-          💾 Lưu cấu hình
-        </button>
+        <button type="button" class="btn btn-primary btn-block" onclick="saveConfig(this)">💾 Lưu cấu hình</button>
       </div>
     </div>
 
     <div class="col">
-
-      <!-- Control card -->
       <div class="card">
         <h2 class="card-title"><span>🎮</span> Điều khiển</h2>
         <div class="btn-group" style="margin-bottom:12px">
           <button type="button" class="btn btn-success" onclick="startBot(this)">▶️ Start Bot</button>
           <button type="button" class="btn btn-danger" onclick="stopBot(this)">⏹ Stop Bot</button>
         </div>
-        <button type="button" class="btn btn-secondary btn-block" style="margin-bottom:12px" onclick="refreshAccounts(this)">
-          🔄 Refresh Accounts
-        </button>
+        <button type="button" class="btn btn-secondary btn-block" style="margin-bottom:12px" onclick="refreshAccounts(this)">🔄 Refresh Accounts</button>
         <div class="input-group">
           <input id="manualCode" type="text" class="input" placeholder="Nhập code redeem thủ công..." autocomplete="off" />
           <button type="button" class="btn btn-primary" onclick="manualRedeem(this)">🚀</button>
         </div>
       </div>
 
-      <!-- Logs card -->
       <div class="card">
         <div class="card-header">
           <h2 class="card-title"><span>📜</span> Logs</h2>
@@ -892,12 +861,9 @@ input,textarea{font:inherit;-webkit-appearance:none;appearance:none}
 
 <script>
 "use strict";
-
-// ============ STATE ============
 let lastLogVer = -1;
 let autoScroll = true;
 
-// ============ TOAST ============
 function toast(msg, level) {
   const box = document.getElementById("toasts");
   const el = document.createElement("div");
@@ -912,7 +878,6 @@ function toast(msg, level) {
   }, 3500);
 }
 
-// ============ LOADING ============
 function setLoading(btn, loading, text) {
   if (!btn) return;
   if (loading) {
@@ -925,7 +890,6 @@ function setLoading(btn, loading, text) {
   }
 }
 
-// ============ API ============
 async function api(url, body) {
   try {
     const res = await fetch(url, {
@@ -939,19 +903,14 @@ async function api(url, body) {
   }
 }
 
-// ============ LOCAL STORAGE ============
 function saveLocal() {
   try {
     localStorage.setItem("lc79_cfg", JSON.stringify({
-      apiId: val("apiId"),
-      apiHash: val("apiHash"),
-      phone: val("phone"),
-      groupLink: val("groupLink"),
-      accounts: getAccounts(),
+      apiId: val("apiId"), apiHash: val("apiHash"), phone: val("phone"),
+      groupLink: val("groupLink"), accounts: getAccounts(),
     }));
   } catch (e) {}
 }
-
 function loadLocal() {
   try {
     const d = JSON.parse(localStorage.getItem("lc79_cfg") || "{}");
@@ -962,13 +921,8 @@ function loadLocal() {
     (d.accounts || []).forEach(a => addAccount(a.un, a.pw, a.nick));
   } catch (e) {}
 }
+function val(id) { const el = document.getElementById(id); return el ? el.value.trim() : ""; }
 
-function val(id) {
-  const el = document.getElementById(id);
-  return el ? el.value.trim() : "";
-}
-
-// ============ ACCOUNTS ============
 function addAccount(un, pw, nick) {
   un = un || ""; pw = pw || ""; nick = nick || "";
   const row = document.createElement("div");
@@ -984,7 +938,6 @@ function addAccount(un, pw, nick) {
   row.querySelector(".acc-remove").onclick = () => row.remove();
   document.getElementById("accountList").appendChild(row);
 }
-
 function getAccounts() {
   const out = [];
   document.querySelectorAll(".acc-row").forEach(r => {
@@ -996,17 +949,14 @@ function getAccounts() {
   return out;
 }
 
-// ============ LOGIN FLOW ============
 function showStep1() {
   document.getElementById("step1").classList.remove("hidden");
   document.getElementById("step2").classList.add("hidden");
 }
-
 function showStep2() {
   document.getElementById("step1").classList.add("hidden");
   document.getElementById("step2").classList.remove("hidden");
 }
-
 function showLoggedIn() {
   document.getElementById("step1").classList.add("hidden");
   document.getElementById("step2").classList.add("hidden");
@@ -1014,35 +964,21 @@ function showLoggedIn() {
 }
 
 async function sendOTP(btn) {
-  const api_id = val("apiId");
-  const api_hash = val("apiHash");
-  const phone = val("phone");
-  if (!api_id || !api_hash || !phone) {
-    toast("Vui lòng điền đủ 3 field", "error");
-    return;
-  }
+  const api_id = val("apiId"), api_hash = val("apiHash"), phone = val("phone");
+  if (!api_id || !api_hash || !phone) { toast("Vui lòng điền đủ 3 field", "error"); return; }
   setLoading(btn, true, "Đang gửi OTP...");
   saveLocal();
   try {
     const r = await api("/api/send_otp", { api_id, api_hash, phone });
-    if (r.ok) {
-      toast("Đã gửi OTP tới " + phone, "success");
-      showStep2();
-    } else {
-      toast(r.error || "Lỗi không xác định", "error");
-    }
-  } finally {
-    setLoading(btn, false);
-  }
+    if (r.ok) { toast("Đã gửi OTP tới " + phone, "success"); showStep2(); }
+    else toast(r.error || "Lỗi không xác định", "error");
+  } finally { setLoading(btn, false); }
 }
 
 async function verifyOTP(btn) {
   const code = val("otpCode");
   const password = document.getElementById("otpPassword").value;
-  if (!code) {
-    toast("Nhập OTP trước", "error");
-    return;
-  }
+  if (!code) { toast("Nhập OTP trước", "error"); return; }
   setLoading(btn, true, "Đang xác nhận...");
   try {
     const r = await api("/api/verify_otp", { code, password });
@@ -1051,14 +987,9 @@ async function verifyOTP(btn) {
       showLoggedIn();
       document.getElementById("otpCode").value = "";
       document.getElementById("otpPassword").value = "";
-    } else if (r.need_password) {
-      toast("Cần mật khẩu 2FA", "warn");
-    } else {
-      toast(r.error || "OTP sai", "error");
-    }
-  } finally {
-    setLoading(btn, false);
-  }
+    } else if (r.need_password) toast("Cần mật khẩu 2FA", "warn");
+    else toast(r.error || "OTP sai", "error");
+  } finally { setLoading(btn, false); }
 }
 
 async function logout(btn) {
@@ -1066,16 +997,10 @@ async function logout(btn) {
   setLoading(btn, true, "Đang logout...");
   try {
     const r = await api("/api/logout", {});
-    if (r.ok) {
-      toast("Đã logout", "warn");
-      showStep1();
-    }
-  } finally {
-    setLoading(btn, false);
-  }
+    if (r.ok) { toast("Đã logout", "warn"); showStep1(); }
+  } finally { setLoading(btn, false); }
 }
 
-// ============ CONFIG ============
 async function saveConfig(btn) {
   const group_link = val("groupLink");
   const accounts = getAccounts();
@@ -1084,98 +1009,62 @@ async function saveConfig(btn) {
   setLoading(btn, true, "Đang lưu...");
   try {
     const r = await api("/api/save_config", { group_link, accounts });
-    if (r.ok) {
-      toast("✅ Đã lưu cấu hình", "success");
-      saveLocal();
-    } else {
-      toast(r.error || "Lỗi lưu", "error");
-    }
-  } finally {
-    setLoading(btn, false);
-  }
+    if (r.ok) { toast("✅ Đã lưu cấu hình", "success"); saveLocal(); }
+    else toast(r.error || "Lỗi lưu", "error");
+  } finally { setLoading(btn, false); }
 }
 
-// ============ CONTROL ============
 async function startBot(btn) {
   setLoading(btn, true, "Đang start...");
   try {
     const r = await api("/api/start_bot", {});
     if (r.ok) toast("Đang khởi động bot...", "success");
     else toast(r.error || "Lỗi", "error");
-  } finally {
-    setLoading(btn, false);
-  }
+  } finally { setLoading(btn, false); }
 }
-
 async function stopBot(btn) {
   if (!confirm("Dừng bot?")) return;
   setLoading(btn, true, "Đang dừng...");
-  try {
-    await api("/api/stop_bot", {});
-    toast("Đã gửi lệnh dừng", "warn");
-  } finally {
-    setLoading(btn, false);
-  }
+  try { await api("/api/stop_bot", {}); toast("Đã gửi lệnh dừng", "warn"); }
+  finally { setLoading(btn, false); }
 }
-
 async function refreshAccounts(btn) {
   setLoading(btn, true, "Đang refresh...");
   try {
     const r = await api("/api/refresh_accounts", {});
     if (!r.ok) toast(r.error || "Lỗi", "error");
     else toast("Đang refresh accounts...", "success");
-  } finally {
-    setTimeout(() => setLoading(btn, false), 800);
-  }
+  } finally { setTimeout(() => setLoading(btn, false), 800); }
 }
-
 async function manualRedeem(btn) {
   const code = val("manualCode").toUpperCase();
   if (!code) { toast("Nhập code", "error"); return; }
   setLoading(btn, true, "");
   try {
     const r = await api("/api/manual_redeem", { code });
-    if (r.ok) {
-      toast("Đang redeem: " + code, "success");
-      document.getElementById("manualCode").value = "";
-    } else {
-      toast(r.error || "Lỗi", "error");
-    }
-  } finally {
-    setLoading(btn, false);
-  }
+    if (r.ok) { toast("Đang redeem: " + code, "success"); document.getElementById("manualCode").value = ""; }
+    else toast(r.error || "Lỗi", "error");
+  } finally { setLoading(btn, false); }
 }
+function clearLogs() { document.getElementById("logs").innerHTML = ""; lastLogVer = -1; }
 
-function clearLogs() {
-  document.getElementById("logs").innerHTML = "";
-  lastLogVer = -1;
-}
-
-// ============ POLL ============
 async function poll() {
   try {
     const res = await fetch("/api/status", { cache: "no-store" });
     const d = await res.json();
-
-    // Badges
     setBadge("badge-login", d.logged_in, d.logged_in ? "Đã login" : "Chưa login");
     setBadge("badge-bot", d.bot_running, d.bot_running ? "Bot online" : "Bot tắt");
 
-    // Login/logout card state
     if (d.logged_in) showLoggedIn();
     else {
       const s1 = document.getElementById("step1");
-      const s2 = document.getElementById("step2");
       const li = document.getElementById("loggedIn");
-      if (s1.classList.contains("hidden") && li.classList.contains("hidden")) {
-        // đang ở step2 → giữ nguyên
-      } else if (li && !li.classList.contains("hidden")) {
+      if (li && !li.classList.contains("hidden")) {
         s1.classList.remove("hidden");
         li.classList.add("hidden");
       }
     }
 
-    // Stats
     setStat("stat-user", d.me ? (d.me.first_name || d.me.username || "?") : "—");
     setStat("stat-group", d.target_chat_id || "—");
     setStat("stat-acc", (d.config.accounts || []).length + " acc");
@@ -1183,27 +1072,21 @@ async function poll() {
     ss.textContent = d.config.has_session ? "✅ Có" : "❌ Chưa";
     ss.className = "stat-value " + (d.config.has_session ? "ok" : "no");
 
-    // Logs
     if (d.logs_version !== lastLogVer) {
       lastLogVer = d.logs_version;
       renderLogs(d.logs || []);
     }
   } catch (e) {}
 }
-
 function setBadge(id, on, text) {
   const el = document.getElementById(id);
   if (!el) return;
   el.classList.toggle("on", !!on);
-  const t = el.querySelector(".txt");
-  if (t) t.textContent = text;
+  const t = el.querySelector(".txt"); if (t) t.textContent = text;
 }
-
 function setStat(id, text) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = text;
+  const el = document.getElementById(id); if (el) el.textContent = text;
 }
-
 function renderLogs(logs) {
   const viewer = document.getElementById("logs");
   const cls = { success: "log-success", error: "log-error", warn: "log-warn" };
@@ -1214,19 +1097,14 @@ function renderLogs(logs) {
   ).join("");
   if (autoScroll) viewer.scrollTop = viewer.scrollHeight;
 }
-
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
-  }[c]));
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
-// ============ INIT ============
 loadLocal();
 if (document.querySelectorAll(".acc-row").length === 0) addAccount();
 poll();
 setInterval(poll, 1500);
-
 const viewer = document.getElementById("logs");
 viewer.addEventListener("scroll", () => {
   autoScroll = viewer.scrollTop + viewer.clientHeight >= viewer.scrollHeight - 20;
