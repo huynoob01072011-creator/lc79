@@ -1,552 +1,1120 @@
 import telebot
 from telebot import types
-from telethon import TelegramClient
+from telethon import TelegramClient, utils, events
 from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
-    PhoneNumberInvalidError,
-    ApiIdInvalidError,
-    PasswordHashInvalidError,
+    SessionPasswordNeededError, PhoneCodeInvalidError,
+    PhoneCodeExpiredError, PhoneNumberInvalidError,
+    ApiIdInvalidError, PasswordHashInvalidError,
 )
-import asyncio
-import threading
-import os
-import html
+import asyncio, threading, os, re, time, random
+import base64, json, html, requests
+from concurrent.futures import ThreadPoolExecutor, wait as fut_wait
+from flask import Flask, jsonify
 
-# ============ CẤU HÌNH ============
+# ================= CONFIG =================
 BOT_TOKEN = "9042450675:AAHWU1HNAzok0avxdy-Ub3PxPTb5DmsD_cg"
 bot = telebot.TeleBot(BOT_TOKEN)
-
 os.makedirs("sessions", exist_ok=True)
 
-# Event loop chạy nền cho Telethon
+DEFAULT_CHAT_ID   = -1002237214360
+DEFAULT_CHAT_USER = "codelaucuagame"
+POLL_INTERVAL     = 0.2
+PRE_REFRESH_SEC   = 180
+HISTORY_MAX       = 50
+
+# Flask config
+FLASK_PORT = int(os.environ.get("PORT", 8080))
+
+API_GET_ACCESS  = "https://apifo88daigia.tele68.com/api"
+LOGIN_URL       = "https://wlb.tele68.com/v1/lobby/auth/login"
+BASE_URL        = "https://gameapi.tele68.com"
+PARAMS          = "/v1/giftcode/redemption?cp=R&cl=R&pf=web&at="
+CONNECT_TIMEOUT = 3
+READ_TIMEOUT    = 10
+MAX_RETRY       = 2
+
+LINE  = "━━━━━━━━━━━━━━━"
+LINE2 = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+
+# ================= FLASK KEEP-ALIVE =================
+flask_app = Flask(__name__)
+START_TIME = time.time()
+
+@flask_app.route("/")
+def index():
+    uptime = int(time.time() - START_TIME)
+    h = uptime // 3600
+    m = (uptime % 3600) // 60
+    s = uptime % 60
+    return (
+        f"<h1>🤖 Bot v8 Online</h1>"
+        f"<p>⏱️ Uptime: {h}h {m}m {s}s</p>"
+        f"<p>👥 Users: {len(user_states)}</p>"
+        f"<p>⚡ Listening: "
+        f"{sum(1 for s in user_states.values() if s.get('step') == 'listening')}</p>"
+    )
+
+@flask_app.route("/ping")
+def ping():
+    return jsonify({
+        "status": "ok",
+        "uptime": int(time.time() - START_TIME),
+        "users": len(user_states),
+        "listening": sum(
+            1 for s in user_states.values()
+            if s.get("step") == "listening"
+        ),
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+@flask_app.route("/health")
+def health():
+    return "OK", 200
+
+def start_flask():
+    flask_app.run(
+        host="0.0.0.0",
+        port=FLASK_PORT,
+        debug=False,
+        use_reloader=False,
+    )
+
+# ================= ASYNC LOOP =================
 _loop = asyncio.new_event_loop()
+
 def _start_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
+
 threading.Thread(target=_start_loop, args=(_loop,), daemon=True).start()
 
 def run_async(coro, timeout=120):
     return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout=timeout)
 
-# State lưu theo user
-# state[user_id] = {step, api_id, api_hash, phone, phone_code_hash, client}
+_executor = ThreadPoolExecutor(max_workers=100, thread_name_prefix="redeem")
+_redeem_tasks = set()
+
+# ================= HELPERS =================
+def normalize_code(raw):
+    if not raw:
+        return None
+    code = re.sub(r"[^A-Z0-9]", "", raw.strip().upper())
+    if code.endswith("LC79") and len(code) > 4:
+        code = code[:-4]
+    return code or None
+
+def extract_code(text):
+    if not text:
+        return None
+    m = re.search(r"Mã code là[:\s]+([A-Z0-9]+)", text)
+    if not m:
+        return None
+    return normalize_code(m.group(1))
+
+# ================= ACCOUNT =================
+class Account:
+    def __init__(self, un, pw, nick):
+        self.un = un
+        self.pw = pw
+        self.nick = nick
+        self.used_codes = set()
+        self.lock = threading.Lock()
+        self.jwt = None
+        self.jwt_exp = 0
+        self.http = requests.Session()
+        self.http.headers.update({
+            "content-type": "application/json",
+            "user-agent": "Mozilla/5.0",
+            "origin": "https://lc79.to",
+            "referer": "https://lc79.to/",
+            "accept": "application/json, text/plain, */*",
+        })
+
+    def _auth(self):
+        return {"authorization": f"Bearer {self.jwt}"}
+
+    @staticmethod
+    def parse_jwt_exp(token):
+        try:
+            p = token.split(".")[1]
+            p += "=" * (-len(p) % 4)
+            return json.loads(base64.urlsafe_b64decode(p)).get("exp", 0)
+        except Exception:
+            return 0
+
+    def is_token_valid(self):
+        if self.jwt is None:
+            return False
+        return time.time() < (self.jwt_exp - 120)
+
+    def get_access_token(self):
+        try:
+            res = self.http.get(
+                API_GET_ACCESS,
+                params={
+                    "c": "3", "un": self.un, "pw": self.pw,
+                    "cp": "R", "cl": "R", "pf": "web", "at": "",
+                },
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            )
+            d = res.json()
+            return d.get("accessToken") if d.get("success") else None
+        except Exception:
+            return None
+
+    def refresh_token(self):
+        token = self.get_access_token()
+        if not token:
+            return False
+        try:
+            res = self.http.post(
+                LOGIN_URL,
+                json={"nickName": self.nick, "accessToken": token},
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                headers={
+                    "origin": "https://lc79b.bet",
+                    "referer": "https://lc79b.bet/",
+                },
+            )
+            new = res.json().get("token")
+            if not new:
+                return False
+            self.jwt = new
+            self.jwt_exp = self.parse_jwt_exp(new)
+            return True
+        except Exception:
+            return False
+
+    def redeem_code(self, code, _attempt=0):
+        with self.lock:
+            if code in self.used_codes:
+                return (False, None)
+            self.used_codes.add(code)
+
+        if not self.is_token_valid():
+            if not self.refresh_token():
+                return (False, None)
+
+        try:
+            res = self.http.post(
+                BASE_URL + PARAMS,
+                headers=self._auth(),
+                json={"code": code, "captcha": ""},
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            )
+            try:
+                data = res.json()
+            except Exception:
+                data = {}
+
+            if res.status_code == 401:
+                if self.refresh_token():
+                    with self.lock:
+                        self.used_codes.discard(code)
+                    return self.redeem_code(code, _attempt)
+                return (False, None)
+
+            if res.status_code in (200, 201):
+                amt = (
+                    data.get("money") or data.get("amount")
+                    or data.get("reward")
+                    or (data.get("data") or {}).get("money")
+                )
+                return (True, amt)
+            return (False, None)
+        except Exception:
+            if _attempt < MAX_RETRY:
+                return self.redeem_code(code, _attempt + 1)
+            return (False, None)
+
+# ================= REDEEM =================
+def redeem_parallel(accounts, code):
+    futures = {_executor.submit(a.redeem_code, code): a for a in accounts}
+    done, _ = fut_wait(futures, timeout=30)
+    results = []
+    for fut in done:
+        acc = futures[fut]
+        try:
+            ok, amt = fut.result()
+        except Exception:
+            ok, amt = False, None
+        results.append((acc.nick, ok, amt))
+    for acc in accounts:
+        if not any(r[0] == acc.nick for r in results):
+            results.append((acc.nick, False, None))
+    return results
+
+# ================= STATE =================
 user_states = {}
 
-LINE  = "━━━━━━━━━━━━━━━━━━━━━━"
-LINE2 = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+def _notify(uid, text):
+    try:
+        bot.send_message(uid, text, parse_mode="HTML")
+    except Exception:
+        pass
 
-
-# ============ /start ============
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.from_user.id
-    user_name = html.escape(message.from_user.first_name or "bạn")
-
-    # Reset state nếu có
-    _cleanup_state(user_id)
-
-    welcome_text = (
-        f"╔══════════════════════╗\n"
-        f"   🌟 <b>WELCOME TO BOT</b> 🌟\n"
-        f"╚══════════════════════╝\n\n"
-        f"👋 Xin chào <b>{user_name}</b>!\n"
-        f"🆔 ID của bạn: <code>{user_id}</code>\n\n"
-        f"{LINE}\n"
-        f"🎯 <b>BOT AUTO NHẬP MÃ CODE LC79</b>\n"
-        f"{LINE}\n\n"
-        f"⚡ <i>Tương tác tự động 100%</i>\n"
-        f"🚀 <i>Tốc độ xử lý cực nhanh</i>\n"
-        f"🔒 <i>Bảo mật thông tin tuyệt đối</i>\n"
-        f"🌐 <i>Hoạt động 24/7 - Không nghỉ</i>\n\n"
-        f"{LINE}\n"
-        f"📖 <b>QUY TRÌNH 3 BƯỚC:</b>\n"
-        f"{LINE}\n\n"
-        f"<b>Bước 1️⃣</b> — Đăng nhập <b>Telegram</b>\n"
-        f"     └─ Lấy api_id &amp; api_hash tại my.telegram.org\n\n"
-        f"<b>Bước 2️⃣</b> — Đăng nhập <b>Game LC79</b>\n"
-        f"     └─ Nhập tài khoản &amp; mật khẩu game\n\n"
-        f"<b>Bước 3️⃣</b> — Đợi thông báo mã code\n"
-        f"     └─ Bot tự động nhập khi có code\n\n"
-        f"{LINE2}\n"
-        f"👇 <b>Bấm nút bên dưới để bắt đầu:</b>"
-    )
-
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("🚀 Bắt Đầu Auto", callback_data="auto_code"),
-        types.InlineKeyboardButton("📖 Hướng Dẫn",    callback_data="help"),
-    )
-    markup.add(
-        types.InlineKeyboardButton("💬 Hỗ Trợ",   callback_data="support"),
-        types.InlineKeyboardButton("ℹ️ Thông Tin", callback_data="info"),
-    )
-    markup.add(types.InlineKeyboardButton("🌐 Website LC79", url="https://lc79.com"))
-
-    bot.send_message(message.chat.id, welcome_text,
-                     reply_markup=markup, parse_mode="HTML",
-                     disable_web_page_preview=True)
-
-
-# ============ CLEANUP ============
-def _cleanup_state(user_id):
-    st = user_states.pop(user_id, None)
+def _cleanup_state(uid):
+    st = user_states.pop(uid, None)
     if not st:
         return
-    client = st.get('client')
+    client = st.get("client")
     if client:
+        h = st.get("handler")
+        if h:
+            try:
+                client.remove_event_handler(h)
+            except Exception:
+                pass
         try:
             run_async(client.disconnect(), timeout=10)
         except Exception:
             pass
 
+def _save_history(uid, code, results, elapsed_ms, manual=False):
+    st = user_states.get(uid)
+    if not st:
+        return
+    hist = st.setdefault("history", [])
+    hist.append({
+        "code": code,
+        "time": time.time(),
+        "ok": sum(1 for _, ok, _ in results if ok),
+        "total": len(results),
+        "manual": manual,
+    })
+    if len(hist) > HISTORY_MAX:
+        del hist[:-HISTORY_MAX]
 
-# ============ CALLBACK ============
-@bot.callback_query_handler(func=lambda c: True)
-def handle_callback(call):
-    chat_id = call.message.chat.id
-    user_id = call.from_user.id
-
-    # 🚀 BẮT ĐẦU AUTO → LOGIN TELEGRAM
-    if call.data == "auto_code":
-        bot.answer_callback_query(call.id, "🔐 Bắt đầu đăng nhập Telegram...")
-        _cleanup_state(user_id)
-        user_states[user_id] = {'step': 'waiting_api_id'}
-
-        text = (
+def _format_history(uid):
+    st = user_states.get(uid)
+    hist = st.get("history", []) if st else []
+    if not hist:
+        return (
             f"╔══════════════════════╗\n"
-            f"   🔐 <b>BƯỚC 1 — LOGIN TELEGRAM</b>\n"
+            f"  🏆 <b>TOP 10 CODE</b>\n"
             f"╚══════════════════════╝\n\n"
             f"{LINE}\n"
-            f"📖 <b>HƯỚNG DẪN LẤY API:</b>\n"
-            f"{LINE}\n\n"
-            f"1️⃣ Truy cập: <b>https://my.telegram.org</b>\n\n"
-            f"2️⃣ Đăng nhập bằng <b>số điện thoại</b> của bạn\n\n"
-            f"3️⃣ Chọn <b>API development tools</b>\n\n"
-            f"4️⃣ Điền form tạo app (nếu chưa có):\n"
-            f"   • App title: <code>AutoCode</code>\n"
-            f"   • Short name: <code>autocode</code>\n"
-            f"   • Platform: <code>Other</code>\n\n"
-            f"5️⃣ Copy 2 thông số:\n"
-            f"   • <b>App api_id</b> — dãy số\n"
-            f"   • <b>App api_hash</b> — chuỗi ký tự\n\n"
+            f"📭 <i>Chưa có code nào!</i>\n"
             f"{LINE2}\n"
-            f"📩 <b>Gửi <code>api_id</code> cho bot:</b>\n"
-            f"└─ Ví dụ: <code>12345678</code>\n\n"
-            f"⚠️ <i>Gõ /cancel để hủy bất cứ lúc nào</i>"
+            f"💡 /setchat để bật auto bắt code"
         )
+    latest = list(reversed(hist[-10:]))
+    text = (
+        f"╔══════════════════════╗\n"
+        f"  🏆 <b>10 CODE GẦN NHẤT</b>\n"
+        f"╚══════════════════════╝\n\n"
+        f"{LINE}\n"
+    )
+    for i, h in enumerate(latest, 1):
+        icon = "💰" if h["ok"] > 0 else "❌"
+        if h.get("manual"):
+            icon = "✍️" + icon
+        t = time.strftime("%H:%M:%S", time.localtime(h["time"]))
+        text += (
+            f"{i:2d}. {icon} <code>{h['code']}</code>  "
+            f"<b>{h['ok']}/{h['total']}</b>  <i>{t}</i>\n"
+        )
+    total_ok = sum(1 for h in hist if h["ok"] > 0)
+    text += (
+        f"{LINE2}\n"
+        f"📊 Tổng đã thử: <b>{len(hist)}</b>\n"
+        f"💰 Thành công: <b>{total_ok}</b>"
+    )
+    return text
 
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 Quay Lại", callback_data="back_start"))
-        bot.send_message(chat_id, text, parse_mode="HTML",
-                         reply_markup=markup, disable_web_page_preview=True)
+# ================= FIRE REDEEM =================
+def _fire_redeem(uid, code, accounts, manual=False):
+    fut = asyncio.run_coroutine_threadsafe(
+        _do_redeem(uid, code, accounts, manual), _loop
+    )
+    _redeem_tasks.add(fut)
+    fut.add_done_callback(_redeem_tasks.discard)
+
+async def _do_redeem(uid, code, accounts, manual=False):
+    t0 = time.time()
+    tag = "✍️ THỦ CÔNG" if manual else "🎁 AUTO"
+    _notify(uid,
+        f"{tag}\n"
+        f"{LINE}\n"
+        f"🔑 <code>{code}</code>\n"
+        f"👥 Bắn: <b>{len(accounts)}</b> acc\n"
+        f"⚡ Đang tranh chấp...")
+    loop = asyncio.get_event_loop()
+    results = await loop.run_in_executor(
+        _executor, redeem_parallel, accounts, code
+    )
+    elapsed = (time.time() - t0) * 1000
+    ok_count = sum(1 for _, ok, _ in results if ok)
+    _save_history(uid, code, results, elapsed, manual)
+    rep = (
+        f"⚡ <b>XONG</b> ({elapsed:.0f}ms)\n"
+        f"{LINE}\n"
+        f"🔑 <code>{code}</code>\n"
+        f"📊 KQ: <b>{ok_count}/{len(results)}</b> OK\n"
+        f"{LINE2}\n"
+    )
+    for nick, ok, amt in results:
+        if ok and amt:
+            rep += f"💰 {nick}: <b>+{int(amt):,}</b>\n"
+        elif ok:
+            rep += f"✅ {nick}: OK\n"
+        else:
+            rep += f"❌ {nick}\n"
+    _notify(uid, rep)
+
+# ================= LISTENER =================
+async def start_listener(client, uid, chat_id, start_id):
+    st = user_states.get(uid)
+    if not st:
+        return
+    last_id = [start_id]
+
+    async def on_new(event):
+        cur = user_states.get(uid, {})
+        if cur.get("step") != "listening":
+            return
+        if event.id <= last_id[0]:
+            return
+        last_id[0] = event.id
+        code = extract_code(event.raw_text or "")
+        if not code:
+            return
+        accounts = cur.get("accounts", [])
+        if not accounts:
+            return
+        _fire_redeem(uid, code, accounts)
+
+    client.add_event_handler(on_new, events.NewMessage(chats=[chat_id]))
+    st["handler"] = on_new
+
+    async def poll_backup():
+        while True:
+            cur = user_states.get(uid, {})
+            if cur.get("step") != "listening":
+                return
+            try:
+                msgs = await client.get_messages(
+                    chat_id, limit=3, min_id=last_id[0]
+                )
+                for msg in reversed(msgs or []):
+                    if msg.id <= last_id[0]:
+                        continue
+                    last_id[0] = msg.id
+                    code = extract_code(msg.raw_text or "")
+                    if not code:
+                        continue
+                    accs = cur.get("accounts", [])
+                    if accs:
+                        _fire_redeem(uid, code, accs)
+            except Exception:
+                pass
+            await asyncio.sleep(POLL_INTERVAL)
+
+    asyncio.create_task(poll_backup())
+
+    async def pre_refresh():
+        while True:
+            cur = user_states.get(uid, {})
+            if cur.get("step") != "listening":
+                return
+            loop = asyncio.get_event_loop()
+            for acc in cur.get("accounts", []):
+                if not acc.is_token_valid():
+                    await loop.run_in_executor(_executor, acc.refresh_token)
+            await asyncio.sleep(PRE_REFRESH_SEC)
+
+    asyncio.create_task(pre_refresh())
+
+# ================= /start =================
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    uid = message.from_user.id
+    name = html.escape(message.from_user.first_name or "bạn")
+    _cleanup_state(uid)
+    text = (
+        f"╔══════════════════════╗\n"
+        f"  🌟 <b>WELCOME TO BOT</b> 🌟\n"
+        f"╚══════════════════════╝\n\n"
+        f"👋 Chào <b>{name}</b>!\n"
+        f"🆔 <code>{uid}</code>\n\n"
+        f"{LINE}\n"
+        f"⚡ <b>AUTO CODE LC79 v8</b>\n"
+        f"{LINE}\n\n"
+        f"🚀 Real-time event &lt; 100ms\n"
+        f"🎯 Bắn song song 100% acc\n"
+        f"🔥 Bỏ LC79 tự động\n"
+        f"💨 Poll backup 0.2s\n"
+        f"🏆 Lưu 50 code gần nhất\n"
+        f"✍️ Nhập code tay khi cần\n"
+        f"🌐 Flask keep-alive\n\n"
+        f"{LINE}\n"
+        f"📖 <b>QUY TRÌNH 3 BƯỚC</b>\n"
+        f"{LINE}\n\n"
+        f"<b>1️⃣</b> Login Telegram\n"
+        f"<b>2️⃣</b> Login LC79\n"
+        f"<b>3️⃣</b> /setchat → auto\n\n"
+        f"{LINE2}\n"
+        f"👇 Bấm nút:"
+    )
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("🚀 Bắt Đầu", callback_data="auto"),
+        types.InlineKeyboardButton("📖 HDSD", callback_data="help"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("✍️ Nhập Tay", callback_data="manual"),
+        types.InlineKeyboardButton("🏆 Top 10", callback_data="codes"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("💬 Hỗ Trợ", callback_data="support"),
+        types.InlineKeyboardButton("ℹ️ Info", callback_data="info"),
+    )
+    bot.send_message(message.chat.id, text,
+                     reply_markup=kb, parse_mode="HTML")
+
+# ================= CALLBACK =================
+@bot.callback_query_handler(func=lambda c: True)
+def on_cb(call):
+    cid = call.message.chat.id
+    uid = call.from_user.id
+
+    if call.data == "auto":
+        bot.answer_callback_query(call.id)
+        _cleanup_state(uid)
+        user_states[uid] = {"step": "api_id"}
+        text = (
+            f"╔══════════════════════╗\n"
+            f"  🔐 <b>BƯỚC 1 — TELEGRAM</b>\n"
+            f"╚══════════════════════╝\n\n"
+            f"{LINE}\n"
+            f"📖 <b>LẤY API:</b>\n"
+            f"{LINE}\n\n"
+            f"🌐 <b>my.telegram.org</b>\n\n"
+            f"1️⃣ Login SĐT Telegram\n"
+            f"2️⃣ Chọn <b>API development tools</b>\n"
+            f"3️⃣ Điền form:\n"
+            f"   • Title: <code>AutoCode</code>\n"
+            f"   • Short: <code>autocode</code>\n"
+            f"   • Platform: <code>Other</code>\n"
+            f"4️⃣ Copy api_id + api_hash\n\n"
+            f"{LINE2}\n"
+            f"📩 Gửi <b>api_id</b>:\n"
+            f"└ VD: <code>12345678</code>\n\n"
+            f"⚠️ /cancel để hủy"
+        )
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔙 Quay Lại", callback_data="back"))
+        bot.send_message(cid, text, parse_mode="HTML", reply_markup=kb)
+
+    elif call.data == "manual":
+        bot.answer_callback_query(call.id)
+        st = user_states.get(uid)
+        if not st or st.get("step") not in ("telegram_done", "listening"):
+            bot.send_message(cid,
+                "⚠️ <b>Chưa login Telegram!</b>\n\n"
+                "Bấm 🚀 Bắt Đầu Auto trước.",
+                parse_mode="HTML")
+            return
+        accounts = st.get("accounts", [])
+        if not accounts:
+            bot.send_message(cid,
+                "⚠️ <b>Chưa có acc game!</b>\n\n"
+                "Gửi: <code>/login user pass</code>",
+                parse_mode="HTML")
+            return
+        st["manual_mode"] = True
+        bot.send_message(cid,
+            f"╔══════════════════════╗\n"
+            f"  ✍️ <b>NHẬP CODE TAY</b>\n"
+            f"╚══════════════════════╝\n\n"
+            f"{LINE}\n"
+            f"📩 Gửi mã code vào đây:\n\n"
+            f"💡 Có thể paste full LC79\n"
+            f"└ VD: <code>YMQTWHXYTLC79</code>\n"
+            f"└ Tự bỏ → <code>YMQTWHXYT</code>\n\n"
+            f"{LINE2}\n"
+            f"⚡ Bot bắn tới <b>{len(accounts)}</b> acc\n"
+            f"🔁 Cho phép retry code cũ\n"
+            f"⚠️ /cancel để hủy",
+            parse_mode="HTML")
+
+    elif call.data == "codes":
+        bot.answer_callback_query(call.id)
+        st = user_states.get(uid)
+        if not st:
+            bot.send_message(cid, "⚠️ Gõ /start trước.")
+            return
+        bot.send_message(cid, _format_history(uid), parse_mode="HTML")
 
     elif call.data == "help":
         bot.answer_callback_query(call.id)
         text = (
             f"╔══════════════════════╗\n"
-            f"   📖 <b>HƯỚNG DẪN CHI TIẾT</b>\n"
+            f"  📖 <b>HƯỚNG DẪN</b>\n"
             f"╚══════════════════════╝\n\n"
             f"{LINE}\n"
-            f"🔐 <b>BƯỚC 1 — LOGIN TELEGRAM</b>\n"
+            f"🔐 <b>B1 — TELEGRAM</b>\n"
             f"{LINE}\n"
-            f"• Bấm nút <b>🚀 Bắt Đầu Auto</b>\n"
-            f"• Bot hướng dẫn lấy <code>api_id</code>, <code>api_hash</code>\n"
-            f"• Gửi lần lượt: api_id → api_hash → SĐT\n"
-            f"• Nhập <b>mã OTP</b> Telegram gửi về\n"
-            f"• Nếu có <b>2FA</b> → nhập mật khẩu 2FA\n\n"
+            f"• 🚀 Bắt Đầu → gửi:\n"
+            f"  1. api_id\n"
+            f"  2. api_hash\n"
+            f"  3. SĐT (+84...)\n"
+            f"• OTP → (2FA) → done\n\n"
             f"{LINE}\n"
-            f"🎮 <b>BƯỚC 2 — LOGIN GAME LC79</b>\n"
+            f"🎮 <b>B2 — GAME</b>\n"
             f"{LINE}\n"
-            f"• Gửi lệnh: <code>/login tài_khoản mật_khẩu</code>\n"
-            f"• Ví dụ: <code>/login user123 pass456</code>\n\n"
+            f"• <code>/login user pass</code>\n"
+            f"• <code>/add user pass</code>\n\n"
             f"{LINE}\n"
-            f"📩 <b>BƯỚC 3 — ĐỢI CODE &amp; AUTO</b>\n"
+            f"⚡ <b>B3 — AUTO</b>\n"
             f"{LINE}\n"
-            f"• Bot tự theo dõi thông báo mã code\n"
-            f"• Tự động nhập khi có code về\n\n"
+            f"• <code>/setchat</code> (kênh mặc định)\n"
+            f"• <code>/setchat @kênh</code>\n\n"
             f"{LINE2}\n"
-            f"⚠️ <b>LƯU Ý:</b>\n"
-            f"• Không chia sẻ api_hash cho ai\n"
-            f"• Gõ /cancel để hủy giữa chừng\n"
-            f"• Gõ /logout để xóa session"
+            f"🎁 <b>NHẬP TAY / LỊCH SỬ</b>\n"
+            f"{LINE2}\n"
+            f"• <code>/code YMQTWHXYT</code>\n"
+            f"  └ Nhập code thủ công\n"
+            f"  └ Cho phép retry code cũ\n\n"
+            f"• <code>/codes</code>\n"
+            f"  └ Xem 10 code gần nhất\n\n"
+            f"{LINE2}\n"
+            f"📋 <b>LỆNH KHÁC</b>\n"
+            f"• /accounts /stop /cancel /logout\n\n"
+            f"{LINE2}\n"
+            f"💡 <b>MẸO THẮNG:</b>\n"
+            f"• VPS gần SG/HK\n"
+            f"• Nhiều acc có nạp\n"
+            f"• Giữ bot online 24/7"
         )
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 Quay Lại", callback_data="back_start"))
-        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔙 Quay Lại", callback_data="back"))
+        bot.send_message(cid, text, parse_mode="HTML", reply_markup=kb)
 
     elif call.data == "support":
         bot.answer_callback_query(call.id)
         text = (
             f"╔══════════════════════╗\n"
-            f"   💬 <b>TRUNG TÂM HỖ TRỢ</b>\n"
+            f"  💬 <b>HỖ TRỢ</b>\n"
             f"╚══════════════════════╝\n\n"
             f"{LINE}\n"
-            f"👨‍💻 <b>Admin:</b> @your_admin\n"
-            f"📢 <b>Channel:</b> @your_channel\n"
-            f"🌐 <b>Website:</b> lc79.com\n"
-            f"📧 <b>Email:</b> support@lc79.com\n"
+            f"👨‍💻 Admin: @your_admin\n"
+            f"📢 Kênh: @{DEFAULT_CHAT_USER}\n"
+            f"🌐 Web: lc79.luxury\n"
             f"{LINE}\n\n"
-            f"⏰ <b>Hỗ trợ:</b> 8:00 - 22:00\n"
-            f"⚡ <b>Phản hồi:</b> Trong 5 phút"
+            f"⏰ 8h - 22h\n"
+            f"⚡ Phản hồi 5 phút"
         )
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 Quay Lại", callback_data="back_start"))
-        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔙 Quay Lại", callback_data="back"))
+        bot.send_message(cid, text, parse_mode="HTML", reply_markup=kb)
 
     elif call.data == "info":
         bot.answer_callback_query(call.id)
+        uptime = int(time.time() - START_TIME)
         text = (
             f"╔══════════════════════╗\n"
-            f"   ℹ️ <b>THÔNG TIN BOT</b>\n"
+            f"  ℹ️ <b>THÔNG TIN</b>\n"
             f"╚══════════════════════╝\n\n"
             f"{LINE}\n"
-            f"🤖 <b>Tên:</b> Auto Code LC79\n"
-            f"📦 <b>Version:</b> v3.0\n"
-            f"⚙️ <b>Engine:</b> Telethon Userbot\n"
-            f"🔐 <b>Login:</b> Real 100% (MTProto)\n"
+            f"🤖 Auto Code LC79\n"
+            f"📦 Version: v8.0\n"
+            f"⚙️ Engine: Telethon Events\n"
+            f"⏱️ Poll backup: {POLL_INTERVAL}s\n"
+            f"🔥 Pre-refresh: {PRE_REFRESH_SEC}s\n"
+            f"📚 History max: {HISTORY_MAX}\n"
+            f"🌐 Uptime: {uptime // 3600}h "
+            f"{(uptime % 3600) // 60}m\n"
+            f"👥 Users: {len(user_states)}\n"
+            f"🌐 Flask: port {FLASK_PORT}\n"
             f"{LINE}\n\n"
-            f"✅ Auto nhập code 100%\n"
-            f"✅ Hỗ trợ 2FA\n"
-            f"✅ Session mã hóa\n"
-            f"✅ Uptime 99.9%\n"
+            f"✅ Event realtime &lt; 100ms\n"
+            f"✅ Song song 100% acc\n"
+            f"✅ Keep-alive HTTP\n"
+            f"✅ Bỏ suffix LC79\n"
+            f"✅ Nhập tay + retry\n"
+            f"✅ Top 10 code\n"
+            f"✅ Flask keep-alive\n"
             f"{LINE2}"
         )
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 Quay Lại", callback_data="back_start"))
-        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔙 Quay Lại", callback_data="back"))
+        bot.send_message(cid, text, parse_mode="HTML", reply_markup=kb)
 
-    elif call.data == "back_start":
+    elif call.data == "back":
         bot.answer_callback_query(call.id)
         try:
-            bot.delete_message(chat_id, call.message.message_id)
+            bot.delete_message(cid, call.message.message_id)
         except Exception:
             pass
-        # Gọi lại start
-        fake = type("M", (), {"chat": call.message.chat,
-                               "from_user": call.from_user,
-                               "message_id": None})()
-        send_welcome(fake)
+        fake = type("M", (), {
+            "chat": call.message.chat,
+            "from_user": call.from_user,
+        })()
+        cmd_start(fake)
 
-
-# ============ LUỒNG LOGIN TELEGRAM ============
-@bot.message_handler(func=lambda m: m.from_user.id in user_states
-                                  and m.text is not None
-                                  and not m.text.startswith('/'))
-def handle_login_flow(message):
-    user_id = message.from_user.id
-    text    = message.text.strip()
-    st      = user_states.get(user_id)
+# ================= LOGIN FLOW =================
+@bot.message_handler(func=lambda m: (
+    m.from_user.id in user_states
+    and m.text is not None
+    and not m.text.startswith("/")
+))
+def login_flow(message):
+    uid = message.from_user.id
+    txt = message.text.strip()
+    st = user_states.get(uid)
     if not st:
         return
 
-    step = st.get('step')
-
-    # ---- (1) Nhập api_id ----
-    if step == 'waiting_api_id':
-        if not text.isdigit() or len(text) < 5:
-            bot.reply_to(message, "❌ <b>api_id không hợp lệ!</b>\n\nPhải là dãy số (VD: <code>12345678</code>).\nThử lại:",
-                         parse_mode="HTML")
-            return
-
-        st['api_id'] = int(text)
-        st['step']   = 'waiting_api_hash'
-        bot.reply_to(
-            message,
-            f"✅ Đã lưu <b>api_id:</b> <code>{text}</code>\n\n"
-            f"{LINE}\n"
-            f"📩 Gửi tiếp <b>api_hash</b>:\n"
-            f"└─ Chuỗi 32 ký tự (VD: <code>a1b2c3d4e5f6...</code>)",
-            parse_mode="HTML"
-        )
-
-    # ---- (2) Nhập api_hash ----
-    elif step == 'waiting_api_hash':
-        if len(text) < 20 or ' ' in text:
-            bot.reply_to(message, "❌ <b>api_hash không hợp lệ!</b>\n\nPhải là chuỗi ≥ 20 ký tự, không có dấu cách.\nThử lại:",
-                         parse_mode="HTML")
-            return
-
-        st['api_hash'] = text
-        st['step']     = 'waiting_phone'
-        bot.reply_to(
-            message,
-            f"✅ Đã lưu <b>api_hash</b>\n\n"
-            f"{LINE}\n"
-            f"📱 Gửi <b>số điện thoại</b> Telegram:\n"
-            f"└─ Format quốc tế: <code>+84901234567</code>\n"
-            f"└─ (Bắt đầu bằng dấu <b>+</b> và mã quốc gia)",
-            parse_mode="HTML"
-        )
-
-    # ---- (3) Nhập SĐT → gửi OTP ----
-    elif step == 'waiting_phone':
-        phone = text.replace(' ', '').replace('-', '').replace('.', '')
-        if not phone.startswith('+'):
+    if st.get("manual_mode"):
+        st["manual_mode"] = False
+        code = normalize_code(txt)
+        if not code or len(code) < 4:
             bot.reply_to(message,
-                         "❌ Số phải bắt đầu bằng <b>+</b>\n"
-                         "VD: <code>+84901234567</code>",
-                         parse_mode="HTML")
+                "❌ <b>Code không hợp lệ!</b>\n"
+                "Gõ /start nếu cần.",
+                parse_mode="HTML")
             return
+        accounts = st.get("accounts", [])
+        if not accounts:
+            bot.reply_to(message,
+                "⚠️ Chưa có acc!\n/login user pass",
+                parse_mode="HTML")
+            return
+        for acc in accounts:
+            acc.used_codes.discard(code)
+        _fire_redeem(uid, code, accounts, manual=True)
+        return
 
-        bot.reply_to(message, "⏳ Đang gửi mã OTP qua Telegram...")
+    step = st.get("step")
+
+    if step == "api_id":
+        if not txt.isdigit() or len(txt) < 5:
+            bot.reply_to(message,
+                "❌ api_id không hợp lệ.\nVD: <code>12345678</code>",
+                parse_mode="HTML")
+            return
+        st["api_id"] = int(txt)
+        st["step"] = "api_hash"
+        bot.reply_to(message,
+            f"✅ api_id: <code>{txt}</code>\n\n"
+            f"📩 Gửi <b>api_hash</b> (32 ký tự):",
+            parse_mode="HTML")
+
+    elif step == "api_hash":
+        if len(txt) < 20 or " " in txt:
+            bot.reply_to(message,
+                "❌ api_hash không hợp lệ (≥20 ký tự, không dấu cách).",
+                parse_mode="HTML")
+            return
+        st["api_hash"] = txt
+        st["step"] = "phone"
+        bot.reply_to(message,
+            f"✅ api_hash đã lưu\n\n"
+            f"📱 Gửi <b>SĐT</b> (+84...):",
+            parse_mode="HTML")
+
+    elif step == "phone":
+        phone = txt.replace(" ", "").replace("-", "")
+        if not phone.startswith("+"):
+            bot.reply_to(message,
+                "❌ SĐT phải bắt đầu bằng +.\nVD: +84901234567",
+                parse_mode="HTML")
+            return
+        bot.reply_to(message, "⏳ Đang gửi OTP...")
+        api_id = st["api_id"]
+        api_hash = st["api_hash"]
+        session = f"sessions/{uid}"
+
+        async def create_and_send():
+            client = TelegramClient(
+                session, api_id, api_hash,
+                flood_sleep_threshold=120,
+                connection_retries=5,
+                retry_delay=2,
+            )
+            await client.connect()
+            if await client.is_user_authorized():
+                return client, {"status": "already"}
+            sent = await client.send_code_request(phone)
+            return client, {"status": "sent",
+                            "hash": sent.phone_code_hash}
 
         try:
-            session_path = f"sessions/{user_id}"
-            client = TelegramClient(session_path, st['api_id'], st['api_hash'])
+            client, result = run_async(create_and_send())
+            st["client"] = client
+            st["phone"] = phone
 
-            async def connect_and_send():
-                await client.connect()
-                if await client.is_user_authorized():
-                    return {'status': 'already'}
-                sent = await client.send_code_request(phone)
-                return {'status': 'sent', 'hash': sent.phone_code_hash}
-
-            result = run_async(connect_and_send())
-            st['client'] = client
-            st['phone']  = phone
-
-            if result['status'] == 'already':
-                st['step'] = 'done'
-                bot.reply_to(
-                    message,
-                    "╔══════════════════════╗\n"
-                    "   ✅ <b>ĐÃ ĐĂNG NHẬP TRƯỚC ĐÓ</b>\n"
-                    "╚══════════════════════╝\n\n"
-                    "🎉 Session Telegram còn hiệu lực!\n\n"
-                    "➡️ <b>Tiếp theo:</b> Login Game LC79\n"
-                    "📩 Gửi: <code>/login tài_khoản mật_khẩu</code>",
-                    parse_mode="HTML"
-                )
+            if result["status"] == "already":
+                st["step"] = "telegram_done"
+                bot.reply_to(message,
+                    f"✅ <b>Session còn hạn!</b>\n\n"
+                    f"➡️ <code>/login user pass</code>",
+                    parse_mode="HTML")
                 return
 
-            st['phone_code_hash'] = result['hash']
-            st['step']            = 'waiting_otp'
-
-            bot.reply_to(
-                message,
-                f"╔══════════════════════╗\n"
-                f"   📨 <b>ĐÃ GỬI OTP</b>\n"
-                f"╚══════════════════════╝\n\n"
-                f"📱 Kiểm tra tin nhắn Telegram của bạn\n"
-                f"(hoặc SMS nếu không có Telegram)\n\n"
-                f"{LINE}\n"
-                f"📩 Nhập mã <b>OTP</b> vào đây:\n"
-                f"└─ Ví dụ: <code>12345</code>\n\n"
-                f"⚠️ <i>Đừng nhập dấu cách. Gõ /cancel để hủy</i>",
-                parse_mode="HTML"
-            )
+            st["phone_code_hash"] = result["hash"]
+            st["step"] = "otp"
+            bot.reply_to(message,
+                f"📨 <b>Đã gửi OTP</b>\n\n"
+                f"📱 Mở Telegram xem tin nhắn\n\n"
+                f"📩 Nhập <b>OTP</b> (chỉ số):",
+                parse_mode="HTML")
 
         except ApiIdInvalidError:
-            _cleanup_state(user_id)
+            _cleanup_state(uid)
             bot.reply_to(message,
-                         "❌ <b>api_id hoặc api_hash SAI!</b>\n\n"
-                         "Kiểm tra lại tại my.telegram.org rồi gõ /start làm lại.",
-                         parse_mode="HTML")
+                "❌ api_id/hash sai!\n/start làm lại.",
+                parse_mode="HTML")
         except PhoneNumberInvalidError:
-            bot.reply_to(message, "❌ Số điện thoại không hợp lệ! Thử lại:")
+            bot.reply_to(message, "❌ SĐT không hợp lệ!")
         except Exception as e:
-            _cleanup_state(user_id)
+            _cleanup_state(uid)
             bot.reply_to(message,
-                         f"❌ <b>Lỗi:</b> <code>{html.escape(str(e))}</code>\n\n"
-                         f"Gõ /start để làm lại.",
-                         parse_mode="HTML")
+                f"❌ Lỗi: <code>{html.escape(str(e))}</code>",
+                parse_mode="HTML")
 
-    # ---- (4) Nhập OTP ----
-    elif step == 'waiting_otp':
-        code = text.replace(' ', '')
+    elif step == "otp":
+        code = txt.replace(" ", "")
+        client = st["client"]
+
+        async def do_sign_in():
+            try:
+                await client.sign_in(
+                    phone=st["phone"], code=code,
+                    phone_code_hash=st["phone_code_hash"])
+                return "ok"
+            except SessionPasswordNeededError:
+                return "2fa"
+
         try:
-            async def sign_in():
-                try:
-                    await st['client'].sign_in(
-                        phone=st['phone'],
-                        code=code,
-                        phone_code_hash=st['phone_code_hash']
-                    )
-                    return 'success'
-                except SessionPasswordNeededError:
-                    return 'need_2fa'
-
-            result = run_async(sign_in())
-
-            if result == 'need_2fa':
-                st['step'] = 'waiting_2fa'
-                bot.reply_to(
-                    message,
-                    f"╔══════════════════════╗\n"
-                    f"   🔐 <b>TÀI KHOẢN CÓ 2FA</b>\n"
-                    f"╚══════════════════════╝\n\n"
-                    f"✅ OTP đúng!\n\n"
-                    f"{LINE}\n"
-                    f"📩 Nhập <b>mật khẩu 2FA</b> của Telegram:\n"
-                    f"└─ Mật khẩu bạn đặt trong\n"
-                    f"   <i>Settings → Privacy → Two-Step Verification</i>\n\n"
-                    f"⚠️ <i>Gõ /cancel để hủy</i>",
-                    parse_mode="HTML"
-                )
-            else:
-                st['step'] = 'done'
-                bot.reply_to(
-                    message,
-                    f"╔══════════════════════╗\n"
-                    f"   ✅ <b>LOGIN THÀNH CÔNG!</b>\n"
-                    f"╚══════════════════════╝\n\n"
-                    f"🎉 Đã đăng nhập Telegram thật 100%\n"
-                    f"📱 SĐT: <code>{html.escape(st['phone'])}</code>\n\n"
-                    f"{LINE2}\n"
-                    f"➡️ <b>BƯỚC 2 — LOGIN GAME LC79</b>\n"
-                    f"📩 Gửi: <code>/login tài_khoản mật_khẩu</code>\n"
-                    f"└─ VD: <code>/login user123 pass456</code>",
-                    parse_mode="HTML"
-                )
-
+            r = run_async(do_sign_in())
+            if r == "2fa":
+                st["step"] = "2fa"
+                bot.reply_to(message,
+                    f"🔐 <b>Có 2FA</b>\n\n"
+                    f"📩 Nhập <b>mật khẩu 2FA</b>:\n"
+                    f"(Settings → Privacy → Two-Step)",
+                    parse_mode="HTML")
+                return
+            st["step"] = "telegram_done"
+            bot.reply_to(message,
+                f"✅ <b>LOGIN TELEGRAM OK</b>\n\n"
+                f"➡️ <code>/login user pass</code>\n"
+                f"└ Thêm: <code>/add user pass</code>",
+                parse_mode="HTML")
         except PhoneCodeInvalidError:
-            bot.reply_to(message, "❌ Mã OTP sai! Nhập lại:")
+            bot.reply_to(message, "❌ OTP sai! Nhập lại:")
         except PhoneCodeExpiredError:
-            _cleanup_state(user_id)
+            _cleanup_state(uid)
             bot.reply_to(message,
-                         "❌ Mã OTP đã hết hạn!\nGõ /start làm lại.",
-                         parse_mode="HTML")
+                "❌ OTP hết hạn!\n/start làm lại.")
         except Exception as e:
             bot.reply_to(message,
-                         f"❌ Lỗi: <code>{html.escape(str(e))}</code>",
-                         parse_mode="HTML")
+                f"❌ <code>{html.escape(str(e))}</code>",
+                parse_mode="HTML")
 
-    # ---- (5) Nhập 2FA ----
-    elif step == 'waiting_2fa':
+    elif step == "2fa":
+        client = st["client"]
+
+        async def do_2fa():
+            await client.sign_in(password=txt)
+
         try:
-            async def sign_2fa():
-                await st['client'].sign_in(password=text)
-
-            run_async(sign_2fa())
-            st['step'] = 'done'
-
-            bot.reply_to(
-                message,
-                f"╔══════════════════════╗\n"
-                f"   ✅ <b>LOGIN 2FA THÀNH CÔNG</b>\n"
-                f"╚══════════════════════╝\n\n"
-                f"🎉 Đã xác thực 2FA thành công!\n"
-                f"🔐 Session đã được mã hóa an toàn\n\n"
-                f"{LINE2}\n"
-                f"➡️ <b>BƯỚC 2 — LOGIN GAME LC79</b>\n"
-                f"📩 Gửi: <code>/login tài_khoản mật_khẩu</code>",
-                parse_mode="HTML"
-            )
+            run_async(do_2fa())
+            st["step"] = "telegram_done"
+            bot.reply_to(message,
+                f"✅ <b>2FA OK</b>\n\n"
+                f"➡️ <code>/login user pass</code>",
+                parse_mode="HTML")
         except PasswordHashInvalidError:
-            bot.reply_to(message, "❌ Mật khẩu 2FA sai! Nhập lại:")
+            bot.reply_to(message, "❌ Pass 2FA sai! Nhập lại:")
         except Exception as e:
             bot.reply_to(message,
-                         f"❌ Lỗi: <code>{html.escape(str(e))}</code>",
-                         parse_mode="HTML")
+                f"❌ <code>{html.escape(str(e))}</code>",
+                parse_mode="HTML")
 
-
-# ============ /login LC79 ============
-@bot.message_handler(commands=['login'])
-def login_game(message):
-    user_id = message.from_user.id
-    parts = message.text.split()
-
-    if user_id not in user_states or user_states[user_id].get('step') != 'done':
-        bot.reply_to(
-            message,
-            "⚠️ <b>Chưa login Telegram!</b>\n\n"
-            "Bấm nút <b>🚀 Bắt Đầu Auto</b> trước để login Telegram.",
-            parse_mode="HTML"
-        )
-        return
-
-    if len(parts) != 3:
-        bot.reply_to(
-            message,
-            "⚠️ <b>Sai cú pháp!</b>\n\n"
-            "📝 Dùng: <code>/login tài_khoản mật_khẩu</code>\n"
-            "💡 VD: <code>/login user123 pass456</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    username, password = parts[1], parts[2]
-    user_states[user_id]['lc79_user'] = username
-    user_states[user_id]['lc79_pass'] = password
-
-    bot.reply_to(
-        message,
-        f"╔══════════════════════╗\n"
-        f"   ✅ <b>LOGIN LC79 THÀNH CÔNG</b>\n"
-        f"╚══════════════════════╝\n\n"
-        f"👤 <b>Tài khoản:</b> <code>{html.escape(username)}</code>\n"
-        f"🎮 <b>Game:</b> LC79\n"
-        f"⚡ <b>Trạng thái:</b> 🟢 Online\n\n"
-        f"{LINE2}\n"
-        f"📩 <i>Đang chờ thông báo mã code...</i>\n"
-        f"🤖 <i>Bot sẽ tự động nhập khi có code về!</i>\n"
-        f"🔔 <i>Giữ bot mở để nhận thông báo!</i>",
-        parse_mode="HTML"
-    )
-
-
-# ============ /cancel ============
-@bot.message_handler(commands=['cancel'])
-def cancel(message):
-    user_id = message.from_user.id
-    if user_id in user_states:
-        _cleanup_state(user_id)
+# ================= /login =================
+@bot.message_handler(commands=["login"])
+def cmd_login(message):
+    uid = message.from_user.id
+    st = user_states.get(uid)
+    if not st or st.get("step") != "telegram_done":
         bot.reply_to(message,
-                     "✅ Đã hủy quy trình.\n\nGõ /start để bắt đầu lại.",
-                     parse_mode="HTML")
-    else:
-        bot.reply_to(message, "ℹ️ Không có quy trình nào đang chạy.")
+            "⚠️ Chưa login Telegram! /start",
+            parse_mode="HTML")
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        bot.reply_to(message,
+            "⚠️ <code>/login user pass</code>",
+            parse_mode="HTML")
+        return
+    un, pw = parts[1], parts[2]
+    bot.reply_to(message, "⏳ Đang login...")
+    acc = Account(un, pw, un)
+    if not acc.refresh_token():
+        bot.reply_to(message,
+            f"❌ Login fail <code>{html.escape(un)}</code>\n"
+            f"Check user/pass.",
+            parse_mode="HTML")
+        return
+    st.setdefault("accounts", []).append(acc)
+    bot.reply_to(message,
+        f"✅ <b>Login OK</b>\n"
+        f"{LINE}\n"
+        f"👤 <code>{html.escape(un)}</code>\n"
+        f"📊 Tổng: <b>{len(st['accounts'])}</b>\n\n"
+        f"➡️ <code>/setchat</code> để bật auto",
+        parse_mode="HTML")
 
+# ================= /add =================
+@bot.message_handler(commands=["add"])
+def cmd_add(message):
+    uid = message.from_user.id
+    st = user_states.get(uid)
+    if not st or st.get("step") not in ("telegram_done", "listening"):
+        bot.reply_to(message, "⚠️ Chưa login Telegram!")
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        bot.reply_to(message,
+            "⚠️ <code>/add user pass</code>",
+            parse_mode="HTML")
+        return
+    un, pw = parts[1], parts[2]
+    bot.reply_to(message, "⏳ Đang thêm...")
+    acc = Account(un, pw, un)
+    if not acc.refresh_token():
+        bot.reply_to(message, f"❌ Fail <code>{html.escape(un)}</code>")
+        return
+    st.setdefault("accounts", []).append(acc)
+    bot.reply_to(message,
+        f"✅ Đã thêm <code>{html.escape(un)}</code>\n"
+        f"📊 Tổng: <b>{len(st['accounts'])}</b>",
+        parse_mode="HTML")
 
-# ============ /logout ============
-@bot.message_handler(commands=['logout'])
-def logout(message):
-    user_id = message.from_user.id
-    _cleanup_state(user_id)
+# ================= /setchat =================
+@bot.message_handler(commands=["setchat"])
+def cmd_setchat(message):
+    uid = message.from_user.id
+    st = user_states.get(uid)
+    if not st or st.get("step") not in ("telegram_done", "listening"):
+        bot.reply_to(message, "⚠️ Chưa login Telegram!")
+        return
+    accounts = st.get("accounts", [])
+    if not accounts:
+        bot.reply_to(message,
+            "⚠️ Chưa có acc!\n/login user pass",
+            parse_mode="HTML")
+        return
 
-    session_file = f"sessions/{user_id}.session"
-    if os.path.exists(session_file):
+    parts = message.text.split(maxsplit=1)
+    target = parts[1].strip() if len(parts) > 1 else None
+    client = st["client"]
+
+    async def resolve():
         try:
-            os.remove(session_file)
-        except Exception:
-            pass
+            if target is None:
+                try:
+                    entity = await client.get_entity(DEFAULT_CHAT_ID)
+                except Exception:
+                    entity = await client.get_entity(DEFAULT_CHAT_USER)
+            elif target.lstrip("-").isdigit():
+                entity = await client.get_entity(int(target))
+            elif "t.me/" in target:
+                un = target.rstrip("/").split("/")[-1].lstrip("@")
+                entity = await client.get_entity(un)
+            else:
+                entity = await client.get_entity(target.lstrip("@"))
+            pid = utils.get_peer_id(entity)
+            latest = await client.get_messages(entity, limit=1)
+            lid = latest[0].id if latest else 0
+            return pid, lid, None
+        except Exception as e:
+            return None, 0, str(e)
+
+    label = target or f"@{DEFAULT_CHAT_USER}"
+    bot.reply_to(message, f"🔍 Kết nối {label}...")
+
+    try:
+        pid, lid, err = run_async(resolve())
+    except Exception as e:
+        pid, lid, err = None, 0, str(e)
+
+    if pid is None:
+        bot.reply_to(message,
+            f"❌ <b>Không kết nối được</b>\n\n"
+            f"⚠️ Join kênh trước\n"
+            f"⚠️ Kênh phải public\n\n"
+            f"Lỗi: <code>{html.escape(str(err))}</code>",
+            parse_mode="HTML")
+        return
+
+    st["target_chat"] = pid
+    st["step"] = "listening"
+
+    asyncio.run_coroutine_threadsafe(
+        start_listener(client, uid, pid, lid), _loop
+    )
 
     bot.reply_to(message,
-                 "✅ Đã đăng xuất và xóa session!\n\n"
-                 "Gõ /start để bắt đầu lại.",
-                 parse_mode="HTML")
+        f"╔══════════════════════╗\n"
+        f"  🎯 <b>AUTO ĐÃ BẬT</b>\n"
+        f"╚══════════════════════╝\n\n"
+        f"{LINE}\n"
+        f"📡 <code>{html.escape(label)}</code>\n"
+        f"🆔 <code>{pid}</code>\n"
+        f"👥 Acc: <b>{len(accounts)}</b>\n"
+        f"{LINE}\n\n"
+        f"⚡ <b>Real-time event</b> &lt;100ms\n"
+        f"💨 Backup poll <b>{POLL_INTERVAL}s</b>\n"
+        f"🔐 Pre-refresh <b>{PRE_REFRESH_SEC}s</b>\n"
+        f"🎯 Bắn song song <b>100%</b>\n\n"
+        f"{LINE2}\n"
+        f"🤖 Đang nghe code...\n"
+        f"✍️ /code để nhập tay\n"
+        f"🏆 /codes xem lịch sử",
+        parse_mode="HTML")
 
+# ================= /code =================
+@bot.message_handler(commands=["code"])
+def cmd_code(message):
+    uid = message.from_user.id
+    st = user_states.get(uid)
+    if not st or st.get("step") not in ("telegram_done", "listening"):
+        bot.reply_to(message,
+            "⚠️ Login Telegram trước!\n/start",
+            parse_mode="HTML")
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message,
+            f"✍️ <b>NHẬP CODE TAY</b>\n"
+            f"{LINE}\n"
+            f"📝 Cú pháp:\n"
+            f"<code>/code YMQTWHXYT</code>\n\n"
+            f"💡 Có thể paste full mã:\n"
+            f"<code>/code YMQTWHXYTLC79</code>\n"
+            f"└ Tự bỏ LC79 → <code>YMQTWHXYT</code>\n\n"
+            f"🔁 Cho phép retry code cũ\n"
+            f"⚡ Bắn song song mọi acc",
+            parse_mode="HTML")
+        return
+    code = normalize_code(parts[1])
+    if not code or len(code) < 4:
+        bot.reply_to(message,
+            "❌ <b>Code không hợp lệ!</b>\n"
+            "VD: <code>YMQTWHXYT</code>",
+            parse_mode="HTML")
+        return
+    accounts = st.get("accounts", [])
+    if not accounts:
+        bot.reply_to(message,
+            "⚠️ Chưa có acc!\n/login user pass",
+            parse_mode="HTML")
+        return
+    for acc in accounts:
+        acc.used_codes.discard(code)
+    _fire_redeem(uid, code, accounts, manual=True)
 
-# ============ TEXT THƯỜNG ============
-@bot.message_handler(func=lambda m: True, content_types=['text'])
-def handle_text(message):
-    # Bỏ qua nếu đang trong flow login
+# ================= /codes =================
+@bot.message_handler(commands=["codes", "history"])
+def cmd_codes(message):
+    uid = message.from_user.id
+    st = user_states.get(uid)
+    if not st:
+        bot.reply_to(message, "⚠️ Gõ /start trước.")
+        return
+    bot.reply_to(message, _format_history(uid), parse_mode="HTML")
+
+# ================= /accounts =================
+@bot.message_handler(commands=["accounts"])
+def cmd_accounts(message):
+    uid = message.from_user.id
+    st = user_states.get(uid)
+    if not st:
+        bot.reply_to(message, "⚠️ /start")
+        return
+    accounts = st.get("accounts", [])
+    if not accounts:
+        bot.reply_to(message,
+            "📭 Chưa có acc.\n/login user pass",
+            parse_mode="HTML")
+        return
+    text = f"👥 <b>ACC LIST</b>\n{LINE}\n"
+    for i, a in enumerate(accounts, 1):
+        icon = "🟢" if a.is_token_valid() else "🟡"
+        text += f"{icon} {i}. <code>{html.escape(a.nick)}</code>\n"
+    text += (
+        f"{LINE2}\n"
+        f"📊 <b>{len(accounts)}</b> acc\n"
+        f"⏱️ Auto: "
+        f"{'🟢 chạy' if st.get('step') == 'listening' else '🔴 tắt'}"
+    )
+    bot.reply_to(message, text, parse_mode="HTML")
+
+# ================= /stop =================
+@bot.message_handler(commands=["stop"])
+def cmd_stop(message):
+    uid = message.from_user.id
+    st = user_states.get(uid)
+    if not st or st.get("step") != "listening":
+        bot.reply_to(message, "ℹ️ Không có auto nào chạy.")
+        return
+    st["step"] = "telegram_done"
+    st["target_chat"] = None
+    bot.reply_to(message,
+        "🛑 <b>Đã dừng auto</b>\n"
+        "Bật lại: /setchat",
+        parse_mode="HTML")
+
+# ================= /cancel & /logout =================
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(message):
+    uid = message.from_user.id
+    if uid in user_states:
+        _cleanup_state(uid)
+        bot.reply_to(message, "✅ Đã hủy.\n/start làm lại.")
+    else:
+        bot.reply_to(message, "ℹ️ Không có gì chạy.")
+
+@bot.message_handler(commands=["logout"])
+def cmd_logout(message):
+    uid = message.from_user.id
+    _cleanup_state(uid)
+    f = f"sessions/{uid}.session"
+    if os.path.exists(f):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+    bot.reply_to(message,
+        "✅ Đã logout và xóa session!\n/start")
+
+# ================= FALLBACK =================
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def fallback(message):
     if message.from_user.id in user_states:
         return
-
-    if message.text.startswith('/'):
-        bot.reply_to(
-            message,
-            "❓ <b>Lệnh không hợp lệ!</b>\n\n"
-            "📖 Gõ /start để xem hướng dẫn\n"
-            "🔐 Gõ /login để đăng nhập game",
-            parse_mode="HTML"
-        )
+    if message.text.startswith("/"):
+        bot.reply_to(message, "❓ Lệnh không hợp lệ.\n/start")
         return
+    bot.reply_to(message,
+        f"📥 <code>{html.escape(message.text)}</code>",
+        parse_mode="HTML")
 
-    bot.reply_to(
-        message,
-        f"📥 <b>Đã nhận mã code:</b>\n"
-        f"<code>{html.escape(message.text)}</code>\n\n"
-        f"⏳ <i>Đang xử lý auto...</i>\n"
-        f"✅ <i>Hoàn thành!</i>",
-        parse_mode="HTML"
-    )
-
-
-# ============ CHẠY BOT ============
+# ================= RUN =================
 if __name__ == "__main__":
-    print("🤖 Bot đang chạy...")
+    print("🤖 Bot v8 đang chạy...")
+    print(f"📡 Kênh: @{DEFAULT_CHAT_USER} ({DEFAULT_CHAT_ID})")
+    print(f"⚡ Backup poll: {POLL_INTERVAL}s")
+    print(f"🏆 History max: {HISTORY_MAX}")
+    print(f"🌐 Flask: http://0.0.0.0:{FLASK_PORT}")
+    print(f"🌐 Ping endpoint: /ping")
+
+    # Start Flask keep-alive
+    threading.Thread(target=start_flask, daemon=True).start()
+
+    # Start bot
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
